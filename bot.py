@@ -273,7 +273,22 @@ async def run_bot():
         await application.stop()
         await application.shutdown()
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    def log_message(self, format, *args):
+        pass # Suppress logging
+
+def start_dummy_server():
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logging.info(f"Dummy web server started on port {port}")
+
 def main():
+    start_dummy_server()
     asyncio.run(run_bot())
 
 if __name__ == "__main__":
