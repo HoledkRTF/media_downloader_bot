@@ -39,13 +39,16 @@ async def download_media(url: str):
             
             res = s.get(json_url)
             if res.status_code != 200:
-                return []
+                return [], None
             
             data = res.json()
             post = data[0]['data']['children'][0]['data']
             
             if post.get('is_video'):
-                return [] # Let yt-dlp handle videos
+                v_url = post.get('media', {}).get('reddit_video', {}).get('fallback_url')
+                if v_url:
+                    return [], v_url
+                return [], None
                 
             media_urls = []
             if 'gallery_data' in post:
@@ -66,6 +69,8 @@ async def download_media(url: str):
                     ext = m_url.split('.')[-1].split('?')[0]
                     if len(ext) > 4: ext = 'jpg'
                     media_urls.append((m_url, ext))
+                else:
+                    return [], m_url
                     
             files = []
             os.makedirs('downloads', exist_ok=True)
@@ -76,10 +81,10 @@ async def download_media(url: str):
                     with open(filename, 'wb') as f:
                         f.write(m_res.content)
                     files.append(filename)
-            return files
+            return files, None
         except Exception as e:
             logger.error(f"Fallback reddit failed: {e}")
-            return []
+            return [], None
 
     def _fallback_image(url):
         try:
@@ -114,10 +119,13 @@ async def download_media(url: str):
             return []
 
     def _download():
+        target_url = url
         if 'reddit.com' in url or 'redd.it' in url:
-            fallback_files = _fallback_reddit_image(url)
+            fallback_files, extracted_url = _fallback_reddit_image(url)
             if fallback_files:
                 return fallback_files
+            if extracted_url:
+                target_url = extracted_url
                 
         ydl_opts = {
             'outtmpl': 'downloads/%(extractor)s_%(id)s.%(ext)s',
@@ -130,7 +138,7 @@ async def download_media(url: str):
         files = []
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(target_url, download=True)
                 if 'entries' in info:
                     for entry in info['entries']:
                         if entry:
@@ -139,7 +147,7 @@ async def download_media(url: str):
                     files.append(ydl.prepare_filename(info))
             return files
         except yt_dlp.utils.DownloadError as e:
-            fallback_files = _fallback_image(url)
+            fallback_files = _fallback_image(target_url)
             if fallback_files:
                 return fallback_files
             raise e
