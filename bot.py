@@ -191,6 +191,9 @@ async def download_media(url: str):
                     if "Due to local regulations" in body_text:
                         logger.error("Twitter Region Blocked.")
                         title_text = "ERROR_REGION_BLOCKED"
+                    else:
+                        page.screenshot(path="downloads/debug_twitter.png")
+                        title_text = "SCREENSHOT_SAVED"
             except Exception as e:
                 logger.error(f"Playwright error: {e}")
             finally:
@@ -211,6 +214,8 @@ async def download_media(url: str):
             extracted_url, extracted_title = _fallback_twitter(url)
             if extracted_title == "ERROR_REGION_BLOCKED":
                 raise Exception("This specific video is blocked due to local regulations (regional restriction on Twitter).")
+            if extracted_title == "SCREENSHOT_SAVED":
+                raise Exception("SCREENSHOT_SAVED")
             if extracted_url:
                 target_url = extracted_url
             if extracted_title:
@@ -367,6 +372,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_msg.edit_text(f"❌ Could not download from this link.\n\n<b>Debug Report:</b>\n<pre>{safe_error}</pre>", parse_mode='HTML')
     except Exception as e:
         import traceback
+        if str(e) == "SCREENSHOT_SAVED" and os.path.exists("downloads/debug_twitter.png"):
+            with open("downloads/debug_twitter.png", 'rb') as f:
+                await update.message.reply_photo(photo=f, caption="❌ Playwright couldn't find the video. Here is what Render is seeing:")
+            return
+            
         logger.error(f"Error processing link: {e}")
         tb = traceback.format_exc().replace('<', '&lt;').replace('>', '&gt;')
         if len(tb) > 3500: tb = "... (truncated)\n" + tb[-3500:]
