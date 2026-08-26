@@ -138,8 +138,9 @@ async def download_media(url: str):
 
         ydl_opts = {
             'outtmpl': 'downloads/%(extractor)s_%(id)s.%(ext)s',
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bv*+ba/b',
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best/bv*+ba/b',
             'merge_output_format': 'mp4',
+            'postprocessor_args': {'merger': ['-c', 'copy']},
             'noplaylist': False,
             'quiet': True,
             'no_warnings': True,
