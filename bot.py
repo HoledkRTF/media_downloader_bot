@@ -127,6 +127,59 @@ async def download_media(url: str):
             logger.error(f"Fallback failed: {e}")
             return []
 
+    def _fallback_twitter(url):
+        import os
+        from playwright.sync_api import sync_playwright
+        import threading
+        video_url = None
+        title_text = None
+        
+        auth = os.environ.get('TWITTER_AUTH_TOKEN', '627b310f25b01fef273fe12963c2c73a805d6ce0')
+        ct0 = os.environ.get('TWITTER_CT0', '33d2d6a03a4d25786d15841355e8d12e26a64a30938c0634682d6f2fa7a36ca12be7106f05ccb58abf26df5d7e49a85570e2aaf2ae9dca30a0001186241294a3d5b7a88cfff2482cf2bbbdb28023f667')
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            context.add_cookies([
+                {'name': 'auth_token', 'value': auth, 'domain': '.twitter.com', 'path': '/'},
+                {'name': 'ct0', 'value': ct0, 'domain': '.twitter.com', 'path': '/'},
+                {'name': 'auth_token', 'value': auth, 'domain': '.x.com', 'path': '/'},
+                {'name': 'ct0', 'value': ct0, 'domain': '.x.com', 'path': '/'}
+            ])
+            page = context.new_page()
+
+            found_event = threading.Event()
+            
+            def handle_response(response):
+                nonlocal video_url, title_text
+                url_str = response.url
+                if 'video.twimg.com' in url_str and (url_str.endswith('.mp4') or url_str.endswith('.m3u8') or '.mp4?' in url_str or '.m3u8?' in url_str):
+                    if not video_url or ('.m3u8' in url_str and '.mp4' in video_url):
+                        video_url = url_str
+                    found_event.set()
+                    
+                if 'graphql' in url_str and ('TweetDetail' in url_str or 'TweetResultByRestId' in url_str):
+                    if response.status == 200:
+                        try:
+                            data = response.json()
+                            tweet = data['data']['tweetResult']['result']
+                            if 'tweet' in tweet: tweet = tweet['tweet']
+                            if 'legacy' in tweet:
+                                title_text = tweet['legacy'].get('full_text')
+                        except Exception:
+                            pass
+            
+            page.on("response", handle_response)
+            try:
+                page.goto(url, wait_until='domcontentloaded', timeout=15000)
+                found_event.wait(timeout=10)
+            except Exception as e:
+                logger.error(f"Playwright error: {e}")
+            finally:
+                browser.close()
+                
+        return video_url, title_text
+
     def _download():
         nonlocal title
         target_url = url
@@ -136,6 +189,12 @@ async def download_media(url: str):
                 return fallback_files
             if extracted_url:
                 target_url = extracted_url
+        elif 'twitter.com' in url or 'x.com' in url:
+            extracted_url, extracted_title = _fallback_twitter(url)
+            if extracted_url:
+                target_url = extracted_url
+            if extracted_title:
+                title = extracted_title
 
         ydl_opts = {
             'outtmpl': 'downloads/%(extractor)s_%(id)s.%(ext)s',
