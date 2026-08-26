@@ -1,6 +1,5 @@
 python-telegram-bot[job-queue]
 yt-dlp
 requests
-playwright
 python-dotenv
 aiohttp

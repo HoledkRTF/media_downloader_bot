@@ -11,12 +11,6 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Ensure Playwright browser is installed at runtime
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
-print("Checking Playwright browsers...")
-os.system("python -m playwright install chromium")
-print("Playwright check complete.")
-
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -134,71 +128,38 @@ async def download_media(url: str):
             return []
 
     def _fallback_twitter(url):
-        import os
-        from playwright.sync_api import sync_playwright
-        import threading
+        import requests
+        import re
         video_url = None
         title_text = None
         
-        auth = os.environ.get('TWITTER_AUTH_TOKEN', '627b310f25b01fef273fe12963c2c73a805d6ce0')
-        ct0 = os.environ.get('TWITTER_CT0', '33d2d6a03a4d25786d15841355e8d12e26a64a30938c0634682d6f2fa7a36ca12be7106f05ccb58abf26df5d7e49a85570e2aaf2ae9dca30a0001186241294a3d5b7a88cfff2482cf2bbbdb28023f667')
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            context.add_cookies([
-                {'name': 'auth_token', 'value': auth, 'domain': '.twitter.com', 'path': '/'},
-                {'name': 'ct0', 'value': ct0, 'domain': '.twitter.com', 'path': '/'},
-                {'name': 'auth_token', 'value': auth, 'domain': '.x.com', 'path': '/'},
-                {'name': 'ct0', 'value': ct0, 'domain': '.x.com', 'path': '/'}
-            ])
-            page = context.new_page()
-
-            found_event = threading.Event()
-            
-            def handle_response(response):
-                nonlocal video_url, title_text
-                url_str = response.url
-                if 'video.twimg.com' in url_str and (url_str.endswith('.mp4') or url_str.endswith('.m3u8') or '.mp4?' in url_str or '.m3u8?' in url_str):
-                    if not video_url or ('.m3u8' in url_str and '.mp4' in video_url):
-                        video_url = url_str
-                    found_event.set()
-                    
-                if 'graphql' in url_str and ('TweetDetail' in url_str or 'TweetResultByRestId' in url_str):
-                    if response.status == 200:
-                        try:
-                            data = response.json()
-                            tweet = data['data']['tweetResult']['result']
-                            if 'tweet' in tweet: tweet = tweet['tweet']
-                            if 'legacy' in tweet:
-                                title_text = tweet['legacy'].get('full_text')
-                        except Exception:
-                            pass
-            
-            page.on("response", handle_response)
-            try:
-                page.goto(url, wait_until='domcontentloaded', timeout=15000)
-                # Try to click the "View" button for sensitive content if it exists
-                try:
-                    page.locator("span", has_text="View").first.click(timeout=3000)
-                except Exception:
-                    pass
-                found_event.wait(timeout=10)
+        try:
+            # Extract tweet ID
+            match = re.search(r'status/(\d+)', url)
+            if not match:
+                return None, None
                 
-                # If still not found, check if there's a restriction message
-                if not video_url:
-                    body_text = page.locator("body").inner_text()
-                    if "Due to local regulations" in body_text:
-                        logger.error("Twitter Region Blocked.")
-                        title_text = "ERROR_REGION_BLOCKED"
-                    else:
-                        page.screenshot(path="downloads/debug_twitter.png")
-                        title_text = "SCREENSHOT_SAVED"
-            except Exception as e:
-                logger.error(f"Playwright error: {e}")
-            finally:
-                browser.close()
+            tweet_id = match.group(1)
+            api_url = f"https://api.vxtwitter.com/Twitter/status/{tweet_id}"
+            
+            res = requests.get(api_url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get('hasMedia') and data.get('mediaURLs'):
+                    # Find highest quality video or just take the first video URL
+                    for media in data.get('media_extended', []):
+                        if media.get('type') == 'video':
+                            video_url = media.get('url')
+                            break
+                    if not video_url:
+                        video_url = data['mediaURLs'][0]
+                    title_text = data.get('text', '')
+            elif res.status_code == 404:
+                return None, "ERROR_REGION_BLOCKED"
                 
+        except Exception as e:
+            logger.error(f"vxtwitter API error: {e}")
+            
         return video_url, title_text
 
     def _download():
