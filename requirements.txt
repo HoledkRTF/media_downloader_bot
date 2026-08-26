@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]
 yt-dlp
 requests
 python-dotenv
+aiohttp
