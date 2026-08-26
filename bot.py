@@ -11,6 +11,12 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Ensure Playwright browser is installed at runtime
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+print("Checking Playwright browsers...")
+os.system("python -m playwright install chromium")
+print("Playwright check complete.")
+
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
