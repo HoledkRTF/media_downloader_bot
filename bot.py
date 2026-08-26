@@ -178,7 +178,19 @@ async def download_media(url: str):
             page.on("response", handle_response)
             try:
                 page.goto(url, wait_until='domcontentloaded', timeout=15000)
+                # Try to click the "View" button for sensitive content if it exists
+                try:
+                    page.locator("span", has_text="View").first.click(timeout=3000)
+                except Exception:
+                    pass
                 found_event.wait(timeout=10)
+                
+                # If still not found, check if there's a restriction message
+                if not video_url:
+                    body_text = page.locator("body").inner_text()
+                    if "Due to local regulations" in body_text:
+                        logger.error("Twitter Region Blocked.")
+                        title_text = "ERROR_REGION_BLOCKED"
             except Exception as e:
                 logger.error(f"Playwright error: {e}")
             finally:
@@ -197,6 +209,8 @@ async def download_media(url: str):
                 target_url = extracted_url
         elif 'twitter.com' in url or 'x.com' in url:
             extracted_url, extracted_title = _fallback_twitter(url)
+            if extracted_title == "ERROR_REGION_BLOCKED":
+                raise Exception("This specific video is blocked due to local regulations (regional restriction on Twitter).")
             if extracted_url:
                 target_url = extracted_url
             if extracted_title:
