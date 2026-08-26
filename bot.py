@@ -289,9 +289,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             with open(photo_path, 'rb') as f:
+                import json
+                payload = {
+                    'photo': json.dumps({"type": "static", "photo": "attach://pfp_file"})
+                }
+                files = {
+                    'pfp_file': ('profile.jpg', f, 'image/jpeg')
+                }
                 res = requests.post(
                     f"https://api.telegram.org/bot{TOKEN}/setMyProfilePhoto",
-                    files={'photo': f}
+                    data=payload,
+                    files=files
                 )
             if res.status_code == 200 and res.json().get('ok'):
                 await update.message.reply_text("✅ Profile picture updated successfully.")
