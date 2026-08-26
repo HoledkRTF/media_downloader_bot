@@ -6,8 +6,6 @@ import requests
 import re
 import time
 import uuid
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -275,9 +273,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(tb) > 3500: tb = "... (truncated)\n" + tb[-3500:]
         await reply_msg.edit_text(f"❌ Error processing link.\n\n<b>Debug Report:</b>\n<pre>{tb}</pre>", parse_mode='HTML')
 
-async def run_bot():
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic cleanup of orphan files in downloads/"""
+    if os.path.exists('downloads'):
+        now = time.time()
+        for f in os.listdir('downloads'):
+            f_path = os.path.join('downloads', f)
+            if os.path.isfile(f_path) and now - os.path.getmtime(f_path) > 600:
+                try:
+                    os.remove(f_path)
+                    logger.info(f"Cleaned up orphan file {f_path}")
+                except:
+                    pass
+
+def main():
     if not TOKEN or TOKEN == 'your_bot_token_here':
-        logger.error("Please set TELEGRAM_BOT_TOKEN in the .env file")
+        logger.error("Please set TELEGRAM_BOT_TOKEN")
         return
 
     application = Application.builder().token(TOKEN).build()
@@ -285,67 +296,16 @@ async def run_bot():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot is starting...")
+    # Cleanup orphan files every 10 minutes
+    application.job_queue.run_repeating(cleanup_job, interval=600, first=600)
 
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-    logger.info("Bot is polling...")
-
-    async def background_tasks():
-        while True:
-            await asyncio.sleep(600)  # 10 minutes
-            try:
-                # Self-ping external URL to prevent Render sleep
-                try:
-                    requests.get(RENDER_URL, timeout=10)
-                    logger.info("Self-ping successful")
-                except:
-                    pass
-                # Cleanup orphans
-                if os.path.exists('downloads'):
-                    now = time.time()
-                    for f in os.listdir('downloads'):
-                        f_path = os.path.join('downloads', f)
-                        if os.path.isfile(f_path) and now - os.path.getmtime(f_path) > 600:
-                            try:
-                                os.remove(f_path)
-                                logger.info(f"Cleaned up orphan file {f_path}")
-                            except:
-                                pass
-            except Exception as e:
-                logger.error(f"Background tasks error: {e}")
-
-    bg_task = asyncio.create_task(background_tasks())
-
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-    def log_message(self, format, *args):
-        pass # Suppress logging
-
-def start_dummy_server():
     port = int(os.environ.get('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    logging.info(f"Dummy web server started on port {port}")
-
-def main():
-    start_dummy_server()
-    asyncio.run(run_bot())
+    application.run_webhook(
+        listen='0.0.0.0',
+        port=port,
+        url_path='webhook',
+        webhook_url=f'{RENDER_URL}/webhook',
+    )
 
 if __name__ == "__main__":
     main()
