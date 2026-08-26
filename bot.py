@@ -1,5 +1,6 @@
 import os
 import asyncio
+import subprocess
 import yt_dlp
 import logging
 import requests
@@ -172,6 +173,22 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+def get_video_dimensions(filepath):
+    """Read actual video width/height via ffprobe so Telegram doesn't guess wrong."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'csv=p=0', filepath],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(',')
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return None, None
+
 async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
     handles = []
@@ -192,7 +209,8 @@ async def send_album(message, files, as_files, caption=None):
                 cap = caption if i == 0 else None
                 pm = 'HTML' if cap else None
                 if f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
-                    group.append(InputMediaVideo(handle, caption=cap, parse_mode=pm))
+                    w, h = get_video_dimensions(f)
+                    group.append(InputMediaVideo(handle, caption=cap, parse_mode=pm, width=w, height=h, supports_streaming=True))
                 else:
                     group.append(InputMediaPhoto(handle, caption=cap, parse_mode=pm))
             for chunk in chunk_list(group, 10):
@@ -239,7 +257,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         elif as_files:
                             await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML')
                         elif f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
-                            await update.message.reply_video(video=doc, caption=caption, parse_mode='HTML')
+                            w, h = get_video_dimensions(f)
+                            await update.message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True)
                         elif f.endswith(('.jpg', '.png', '.jpeg')):
                             await update.message.reply_photo(photo=doc, caption=caption, parse_mode='HTML')
                         else:
