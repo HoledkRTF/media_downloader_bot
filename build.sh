@@ -4,5 +4,8 @@ set -e
 # Install python dependencies
 pip install -r requirements.txt
 
-# Install Playwright chromium browser with dependencies
-playwright install --with-deps chromium
+# Explicitly export the path so it installs locally to the venv
+export PLAYWRIGHT_BROWSERS_PATH=0
+
+# Install Playwright chromium browser (without system deps to avoid sudo requirements)
+python -m playwright install chromium
