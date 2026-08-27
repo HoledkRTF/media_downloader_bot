@@ -234,39 +234,21 @@ def get_video_dimensions(filepath):
         pass
     return None, None
 
-def compress_video(input_path, output_path, target_size_mb=48):
-    """Compress video to a target size in MB using ffmpeg."""
+def upload_to_gofile(filepath):
+    """Upload large file to gofile.io and return the download link."""
+    import requests
     try:
-        import subprocess
-        # Get duration
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
-             '-of', 'default=noprint_wrappers=1:nokey=1', input_path],
-            capture_output=True, text=True, timeout=10
-        )
-        duration = float(result.stdout.strip())
-        
-        # Calculate target total bitrate (bits per second)
-        # target_size_mb * 8 (bits/byte) * 1024 * 1024
-        target_bitrate = int((target_size_mb * 8388608) / duration)
-        
-        # Reserve 64kbps for audio
-        video_bitrate = target_bitrate - 64000
-        if video_bitrate < 50000:
-            video_bitrate = 50000 # Minimum floor
-            
-        cmd = [
-            'ffmpeg', '-y', '-i', input_path,
-            '-c:v', 'libx264', '-b:v', str(video_bitrate),
-            '-preset', 'superfast',
-            '-c:a', 'aac', '-b:a', '64k',
-            output_path
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        return True
+        r = requests.get('https://api.gofile.io/servers', timeout=10)
+        if r.status_code == 200 and r.json().get('status') == 'ok':
+            server = r.json()['data']['servers'][0]['name']
+            url = f'https://{server}.gofile.io/contents/uploadfile'
+            with open(filepath, 'rb') as f:
+                r2 = requests.post(url, files={'file': f})
+            if r2.status_code == 200 and r2.json().get('status') == 'ok':
+                return r2.json()['data']['downloadPage']
     except Exception as e:
-        logger.error(f"Compression failed: {e}")
-        return False
+        logger.error(f"Gofile upload error: {e}")
+    return None
 
 async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
@@ -331,22 +313,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if os.path.exists(f) and os.path.getsize(f) > 0:
                     if os.path.getsize(f) > 50 * 1024 * 1024:
-                        if f.endswith(('.mp4', '.webm', '.mkv')):
-                            await reply_msg.edit_text("⏳ File is over 50MB. Compressing video to fit Telegram's limits...")
-                            compressed_file = f + "_compressed.mp4"
-                            success = compress_video(f, compressed_file, target_size_mb=48)
-                            if success and os.path.exists(compressed_file) and os.path.getsize(compressed_file) <= 50 * 1024 * 1024:
-                                os.remove(f)
-                                f = compressed_file
-                            else:
-                                await reply_msg.edit_text("❌ File is larger than Telegram's 50MB bot limit and compression failed.")
-                                if os.path.exists(f): os.remove(f)
-                                if os.path.exists(compressed_file): os.remove(compressed_file)
-                                return
+                        await reply_msg.edit_text("⏳ File is over 50MB! Uploading the uncompressed original to Gofile...")
+                        gofile_link = upload_to_gofile(f)
+                        if gofile_link:
+                            await reply_msg.edit_text(f"✅ Download complete! The file was too large for Telegram, so I uploaded the full uncompressed original here:\n\n🔗 {gofile_link}", parse_mode='HTML', disable_web_page_preview=True)
                         else:
-                            await reply_msg.edit_text("❌ File is larger than Telegram's 50MB bot limit and cannot be compressed.")
-                            if os.path.exists(f): os.remove(f)
-                            return
+                            await reply_msg.edit_text("❌ File is larger than Telegram's 50MB bot limit and Gofile upload failed.")
+                        if os.path.exists(f): os.remove(f)
+                        return
                             
                     with open(f, 'rb') as doc:
                         if as_files:
