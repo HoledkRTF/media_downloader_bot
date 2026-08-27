@@ -234,6 +234,40 @@ def get_video_dimensions(filepath):
         pass
     return None, None
 
+def compress_video(input_path, output_path, target_size_mb=48):
+    """Compress video to a target size in MB using ffmpeg."""
+    try:
+        import subprocess
+        # Get duration
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+             '-of', 'default=noprint_wrappers=1:nokey=1', input_path],
+            capture_output=True, text=True, timeout=10
+        )
+        duration = float(result.stdout.strip())
+        
+        # Calculate target total bitrate (bits per second)
+        # target_size_mb * 8 (bits/byte) * 1024 * 1024
+        target_bitrate = int((target_size_mb * 8388608) / duration)
+        
+        # Reserve 64kbps for audio
+        video_bitrate = target_bitrate - 64000
+        if video_bitrate < 50000:
+            video_bitrate = 50000 # Minimum floor
+            
+        cmd = [
+            'ffmpeg', '-y', '-i', input_path,
+            '-c:v', 'libx264', '-b:v', str(video_bitrate),
+            '-preset', 'superfast',
+            '-c:a', 'aac', '-b:a', '64k',
+            output_path
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return True
+    except Exception as e:
+        logger.error(f"Compression failed: {e}")
+        return False
+
 async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
     handles = []
@@ -296,10 +330,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f = files[0]
             try:
                 if os.path.exists(f) and os.path.getsize(f) > 0:
+                    if os.path.getsize(f) > 50 * 1024 * 1024:
+                        if f.endswith(('.mp4', '.webm', '.mkv')):
+                            await reply_msg.edit_text("⏳ File is over 50MB. Compressing video to fit Telegram's limits...")
+                            compressed_file = f + "_compressed.mp4"
+                            success = compress_video(f, compressed_file, target_size_mb=48)
+                            if success and os.path.exists(compressed_file) and os.path.getsize(compressed_file) <= 50 * 1024 * 1024:
+                                os.remove(f)
+                                f = compressed_file
+                            else:
+                                await reply_msg.edit_text("❌ File is larger than Telegram's 50MB bot limit and compression failed.")
+                                if os.path.exists(f): os.remove(f)
+                                if os.path.exists(compressed_file): os.remove(compressed_file)
+                                return
+                        else:
+                            await reply_msg.edit_text("❌ File is larger than Telegram's 50MB bot limit and cannot be compressed.")
+                            if os.path.exists(f): os.remove(f)
+                            return
+                            
                     with open(f, 'rb') as doc:
-                        if os.path.getsize(f) > 50 * 1024 * 1024:
-                            await update.message.reply_text("❌ File is larger than Telegram's 50MB bot limit.")
-                        elif as_files:
+                        if as_files:
                             await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML')
                         elif f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
                             w, h = get_video_dimensions(f)
@@ -310,7 +360,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Failed to send file: {e}")
-                await update.message.reply_text(f"❌ Failed to send file to Telegram.")
+                await reply_msg.edit_text(f"❌ Failed to send file to Telegram.")
+                return
             finally:
                 if os.path.exists(f):
                     os.remove(f)
