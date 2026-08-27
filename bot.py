@@ -96,8 +96,22 @@ async def download_media(url: str):
             return [], None
 
     def _fallback_image(url):
+        temp_dir = 'downloads'
+        ydl_opts = {
+            'format': 'best',
+            'outtmpl': f'{temp_dir}/%(id)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        # Add Instagram cookie if provided in .env to bypass the strict login wall
+        ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
+        if ig_cookie and ('instagram.com' in url or 'ig.me' in url):
+            ydl_opts['http_headers'] = {
+                'Cookie': f'sessionid={ig_cookie}'
+            }
+
         try:
-            ydl_opts = {'quiet': True, 'no_warnings': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False, process=False)
 
@@ -191,6 +205,14 @@ async def download_media(url: str):
             'quiet': True,
             'no_warnings': True,
         }
+        
+        # Add Instagram cookie if provided in .env to bypass the strict login wall
+        ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
+        if ig_cookie and ('instagram.com' in url or 'ig.me' in url):
+            ydl_opts['http_headers'] = {
+                'Cookie': f'sessionid={ig_cookie}'
+            }
+            
         os.makedirs('downloads', exist_ok=True)
         files = []
         try:
