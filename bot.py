@@ -234,20 +234,17 @@ def get_video_dimensions(filepath):
         pass
     return None, None
 
-def upload_to_gofile(filepath):
-    """Upload large file to gofile.io and return the download link."""
+def upload_to_catbox(filepath):
+    """Upload large file to catbox.moe (200MB limit) and return direct link."""
     import requests
     try:
-        r = requests.get('https://api.gofile.io/servers', timeout=10)
-        if r.status_code == 200 and r.json().get('status') == 'ok':
-            server = r.json()['data']['servers'][0]['name']
-            url = f'https://{server}.gofile.io/contents/uploadfile'
-            with open(filepath, 'rb') as f:
-                r2 = requests.post(url, files={'file': f})
-            if r2.status_code == 200 and r2.json().get('status') == 'ok':
-                return r2.json()['data']['downloadPage']
+        url = 'https://catbox.moe/user/api.php'
+        with open(filepath, 'rb') as f:
+            r = requests.post(url, data={'reqtype': 'fileupload'}, files={'fileToUpload': f})
+        if r.status_code == 200 and r.text.startswith('https://'):
+            return r.text.strip()
     except Exception as e:
-        logger.error(f"Gofile upload error: {e}")
+        logger.error(f"Catbox upload error: {e}")
     return None
 
 async def send_album(message, files, as_files, caption=None):
@@ -313,12 +310,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if os.path.exists(f) and os.path.getsize(f) > 0:
                     if os.path.getsize(f) > 50 * 1024 * 1024:
-                        await reply_msg.edit_text("⏳ File is over 50MB! Uploading the uncompressed original to Gofile...")
-                        gofile_link = upload_to_gofile(f)
-                        if gofile_link:
-                            await reply_msg.edit_text(f"✅ Download complete! The file was too large for Telegram, so I uploaded the full uncompressed original here:\n\n🔗 {gofile_link}", parse_mode='HTML', disable_web_page_preview=True)
+                        await reply_msg.edit_text("⏳ File is over 50MB! Uploading the uncompressed original to Catbox...")
+                        cloud_link = upload_to_catbox(f)
+                        if cloud_link:
+                            await reply_msg.edit_text(f"✅ Download complete! The file was too large for Telegram, so I uploaded the full uncompressed original here:\n\n🔗 {cloud_link}", parse_mode='HTML', disable_web_page_preview=True)
                         else:
-                            await reply_msg.edit_text("❌ File is larger than Telegram's 50MB bot limit and Gofile upload failed.")
+                            await reply_msg.edit_text("❌ File is larger than Telegram's 50MB bot limit and cloud upload failed.")
                         if os.path.exists(f): os.remove(f)
                         return
                             
