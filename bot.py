@@ -273,9 +273,30 @@ async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
     handles = []
     try:
+        # Check files for size limit. Any file > 50MB gets sent to Catbox instead.
+        large_files = []
+        valid_files = []
+        for f in files:
+            if os.path.exists(f) and os.path.getsize(f) > 50 * 1024 * 1024:
+                large_files.append(f)
+            else:
+                valid_files.append(f)
+        
+        # If there are large files, upload them to catbox and notify the user
+        for lf in large_files:
+            await message.reply_text("⏳ A file in this album is over 50MB! Uploading the uncompressed original to Catbox...")
+            cloud_link = upload_to_catbox(lf)
+            if cloud_link:
+                await message.reply_text(f"✅ One of the files was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True)
+            else:
+                await message.reply_text("❌ A file was larger than Telegram's 50MB limit and cloud upload failed.")
+                
+        if not valid_files:
+            return
+
         if as_files:
             group = []
-            for i, f in enumerate(files):
+            for i, f in enumerate(valid_files):
                 handle = open(f, 'rb')
                 handles.append(handle)
                 group.append(InputMediaDocument(handle, caption=caption if i == 0 else None, parse_mode='HTML' if caption else None))
@@ -283,7 +304,7 @@ async def send_album(message, files, as_files, caption=None):
                 await message.reply_media_group(media=chunk)
         else:
             group = []
-            for i, f in enumerate(files):
+            for i, f in enumerate(valid_files):
                 handle = open(f, 'rb')
                 handles.append(handle)
                 cap = caption if i == 0 else None
@@ -387,46 +408,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(tb) > 3500: tb = "... (truncated)\n" + tb[-3500:]
         await reply_msg.edit_text(f"❌ Error processing link.\n\n<b>Debug Report:</b>\n<pre>{tb}</pre>", parse_mode='HTML')
 
-async def adminmisuse(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if args and args[0] == "69420":
-        context.user_data['awaiting_pfp'] = True
-        await update.message.reply_text("Admin mode unlocked. Send me a photo to use as my new profile picture.")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('awaiting_pfp'):
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        os.makedirs('downloads', exist_ok=True)
-        photo_path = f"downloads/pfp_{uuid.uuid4().hex}.jpg"
-        await file.download_to_drive(photo_path)
-        
-        try:
-            with open(photo_path, 'rb') as f:
-                import json
-                payload = {
-                    'photo': json.dumps({"type": "static", "photo": "attach://pfp_file"})
-                }
-                files = {
-                    'pfp_file': ('profile.jpg', f, 'image/jpeg')
-                }
-                res = requests.post(
-                    f"https://api.telegram.org/bot{TOKEN}/setMyProfilePhoto",
-                    data=payload,
-                    files=files
-                )
-            if res.status_code == 200 and res.json().get('ok'):
-                await update.message.reply_text("✅ Profile picture updated successfully.")
-            else:
-                await update.message.reply_text(f"❌ Failed to update profile picture: {res.text}")
-        except Exception as e:
-            logger.error(f"Error setting pfp: {e}")
-            await update.message.reply_text("❌ Error setting profile picture.")
-        finally:
-            if os.path.exists(photo_path):
-                os.remove(photo_path)
-            context.user_data['awaiting_pfp'] = False
-
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     """Periodic cleanup of orphan files in downloads/"""
     if os.path.exists('downloads'):
@@ -450,8 +431,6 @@ async def main():
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("adminmisuse", adminmisuse))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Cleanup orphan files every 10 minutes
