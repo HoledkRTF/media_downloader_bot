@@ -21,22 +21,27 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-2ia1.onrender.com")
 
-KVDB_BUCKET = "V7yCXp9Ueoonh8PxqPmmHi"
+import json
 
 def get_wishlist(user_id):
     try:
-        r = requests.get(f"https://kvdb.io/{KVDB_BUCKET}/wishlist_{user_id}", timeout=5)
-        if r.status_code == 200:
-            import json
-            return json.loads(r.text)
+        if os.path.exists('wishlist.json'):
+            with open('wishlist.json', 'r') as f:
+                data = json.load(f)
+                return data.get(str(user_id), [])
     except Exception as e:
         logger.error(f"Error getting wishlist: {e}")
     return []
 
 def save_wishlist(user_id, wishlist):
     try:
-        import json
-        requests.post(f"https://kvdb.io/{KVDB_BUCKET}/wishlist_{user_id}", data=json.dumps(wishlist), timeout=5)
+        data = {}
+        if os.path.exists('wishlist.json'):
+            with open('wishlist.json', 'r') as f:
+                data = json.load(f)
+        data[str(user_id)] = wishlist
+        with open('wishlist.json', 'w') as f:
+            json.dump(data, f)
     except Exception as e:
         logger.error(f"Error saving wishlist: {e}")
 
