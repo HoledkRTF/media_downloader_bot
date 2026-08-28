@@ -325,6 +325,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # Check for nhentai 5-6 digit code
+    nh_match = re.fullmatch(r'(\d{5,6})', text.strip())
+    if nh_match:
+        code = nh_match.group(1)
+        reply_msg = await update.message.reply_text("⏳ Fetching doujin info...")
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            r = await asyncio.to_thread(requests.get, f'https://nhentai.to/g/{code}', timeout=10)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, 'html.parser')
+                cover_div = soup.find('div', id='cover')
+                info_div = soup.find('div', id='info')
+                
+                if cover_div and cover_div.find('img') and info_div and info_div.find('h1'):
+                    cover_url = cover_div.find('img')['src']
+                    title = info_div.find('h1').text.strip()
+                    
+                    # Download cover
+                    img_res = await asyncio.to_thread(requests.get, cover_url, timeout=10)
+                    if img_res.status_code == 200:
+                        os.makedirs('downloads', exist_ok=True)
+                        cover_path = f"downloads/nh_{code}.jpg"
+                        with open(cover_path, 'wb') as f:
+                            f.write(img_res.content)
+                            
+                        caption = f"📖 <b>{title.replace('<', '&lt;').replace('>', '&gt;')}</b>\n🔗 <a href=\"https://nhentai.net/g/{code}\">nhentai.net/g/{code}</a>"
+                        with open(cover_path, 'rb') as f:
+                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
+                            
+                        os.remove(cover_path)
+                        await reply_msg.delete()
+                        return
+            
+            await reply_msg.edit_text("❌ Could not fetch info for that code. It might not exist.")
+        except Exception as e:
+            logger.error(f"Error fetching nhentai: {e}")
+            await reply_msg.edit_text("❌ Error fetching doujin info.")
+        return
+
     urls = re.findall(r'(https?://\S+)', text)
     if not urls:
         return
