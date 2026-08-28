@@ -350,10 +350,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = nh_match.group(1)
         reply_msg = await update.message.reply_text("⏳ Fetching doujin info...")
         try:
-            import cloudscraper
+            from curl_cffi import requests as c_requests
             from bs4 import BeautifulSoup
-            scraper = cloudscraper.create_scraper()
-            r = await asyncio.to_thread(scraper.get, f'https://nhentai.net/g/{code}', timeout=10)
+            r = await asyncio.to_thread(c_requests.get, f'https://nhentai.net/g/{code}', impersonate='chrome110', timeout=10)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, 'html.parser')
                 cover_div = soup.find('div', id='cover')
@@ -380,7 +379,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     save_wishlist(user_id, wishlist)
                     
                     # Download cover
-                    img_res = await asyncio.to_thread(scraper.get, cover_url, timeout=10)
+                    img_res = await asyncio.to_thread(c_requests.get, cover_url, impersonate='chrome110', timeout=10)
                     if img_res.status_code == 200:
                         os.makedirs('downloads', exist_ok=True)
                         cover_path = f"downloads/nh_{code}.jpg"
@@ -604,9 +603,8 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # We can't edit a text message into a photo message directly, 
         # so we send a new photo message and delete the old menu message.
-        import cloudscraper
-        scraper = cloudscraper.create_scraper()
-        img_res = await asyncio.to_thread(scraper.get, item['cover_url'], timeout=10)
+        from curl_cffi import requests as c_requests
+        img_res = await asyncio.to_thread(c_requests.get, item['cover_url'], impersonate='chrome110', timeout=10)
         if img_res.status_code == 200:
             os.makedirs('downloads', exist_ok=True)
             cover_path = f"downloads/wh_{code}.jpg"

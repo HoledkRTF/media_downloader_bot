@@ -1,5 +1,6 @@
 python-telegram-bot[job-queue]
 yt-dlp
+curl_cffi
 requests
 python-dotenv
 aiohttp
