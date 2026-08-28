@@ -21,6 +21,25 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-2ia1.onrender.com")
 
+KVDB_BUCKET = "V7yCXp9Ueoonh8PxqPmmHi"
+
+def get_wishlist(user_id):
+    try:
+        r = requests.get(f"https://kvdb.io/{KVDB_BUCKET}/wishlist_{user_id}", timeout=5)
+        if r.status_code == 200:
+            import json
+            return json.loads(r.text)
+    except Exception as e:
+        logger.error(f"Error getting wishlist: {e}")
+    return []
+
+def save_wishlist(user_id, wishlist):
+    try:
+        import json
+        requests.post(f"https://kvdb.io/{KVDB_BUCKET}/wishlist_{user_id}", data=json.dumps(wishlist), timeout=5)
+    except Exception as e:
+        logger.error(f"Error saving wishlist: {e}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a link from Reddit, RedGifs, Twitter, or Instagram and I'll download the media for you.\n\n"
@@ -342,6 +361,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if cover_div and cover_div.find('img') and info_div and info_div.find('h1'):
                     cover_url = cover_div.find('img')['src']
                     title = info_div.find('h1').text.strip()
+                    tags = [a.find('span', class_='name').text for a in soup.find_all('a', class_='tag') if a.find('span', class_='name')]
+                    
+                    # Save to wishlist database
+                    user_id = update.message.from_user.id
+                    wishlist = get_wishlist(user_id)
+                    # Remove if already exists to move to top
+                    wishlist = [item for item in wishlist if item.get('code') != code]
+                    wishlist.insert(0, {
+                        'code': code,
+                        'title': title,
+                        'cover_url': cover_url,
+                        'tags': tags
+                    })
+                    # Keep only last 100 to avoid KV limit
+                    if len(wishlist) > 100: wishlist = wishlist[:100]
+                    save_wishlist(user_id, wishlist)
                     
                     # Download cover
                     img_res = await asyncio.to_thread(requests.get, cover_url, timeout=10)
@@ -351,7 +386,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         with open(cover_path, 'wb') as f:
                             f.write(img_res.content)
                             
-                        caption = f"📖 <b>{title.replace('<', '&lt;').replace('>', '&gt;')}</b>\n🔗 <a href=\"https://nhentai.net/g/{code}\">nhentai.net/g/{code}</a>"
+                        caption = f"📖 <b>{title.replace('<', '&lt;').replace('>', '&gt;')}</b>\n🔗 <a href=\"https://nhentai.net/g/{code}\">nhentai.net/g/{code}</a>\n✅ <i>Saved to your /wh wishlist!</i>"
                         with open(cover_path, 'rb') as f:
                             await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
                             
@@ -488,6 +523,123 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(photo_path)
             context.user_data['awaiting_pfp'] = False
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+async def wh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    wishlist = get_wishlist(user_id)
+    
+    if not wishlist:
+        await update.message.reply_text("📭 Your wishlist is empty! Send me a 5 or 6 digit nhentai code to save one.")
+        return
+        
+    page = 0
+    keyboard = build_wh_keyboard(wishlist, page)
+    await update.message.reply_text(
+        f"📖 <b>Your Doujin Wishlist</b> (Page {page+1})\n<i>Select a title to view details:</i>",
+        reply_markup=keyboard,
+        parse_mode='HTML'
+    )
+
+def build_wh_keyboard(wishlist, page):
+    ITEMS_PER_PAGE = 10
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    current_items = wishlist[start:end]
+    
+    keyboard = []
+    for item in current_items:
+        title = item['title'][:40] + "..." if len(item['title']) > 40 else item['title']
+        keyboard.append([InlineKeyboardButton(title, callback_data=f"wh_view_{item['code']}")])
+        
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"wh_page_{page-1}"))
+    if end < len(wishlist):
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"wh_page_{page+1}"))
+        
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+        
+    return InlineKeyboardMarkup(keyboard)
+
+async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+    
+    wishlist = get_wishlist(user_id)
+    
+    if data.startswith("wh_page_"):
+        page = int(data.split("_")[2])
+        keyboard = build_wh_keyboard(wishlist, page)
+        await query.edit_message_text(
+            f"📖 <b>Your Doujin Wishlist</b> (Page {page+1})\n<i>Select a title to view details:</i>",
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        return
+        
+    if data.startswith("wh_view_"):
+        code = data.split("_")[2]
+        item = next((i for i in wishlist if i['code'] == code), None)
+        if not item:
+            await query.edit_message_text("❌ Item not found in wishlist.")
+            return
+            
+        tags = item.get('tags', [])
+        tag_str = ", ".join(tags) if tags else "No tags found"
+        caption = (
+            f"📖 <b>{item['title'].replace('<', '&lt;').replace('>', '&gt;')}</b>\n"
+            f"🏷️ <b>Tags:</b> {tag_str}\n"
+            f"🔗 <a href=\"https://nhentai.net/g/{code}\">nhentai.net/g/{code}</a>"
+        )
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Remove from Wishlist", callback_data=f"wh_del_{code}")],
+            [InlineKeyboardButton("🔙 Back to List", callback_data="wh_page_0")]
+        ])
+        
+        # We can't edit a text message into a photo message directly, 
+        # so we send a new photo message and delete the old menu message.
+        import requests
+        img_res = await asyncio.to_thread(requests.get, item['cover_url'], timeout=10)
+        if img_res.status_code == 200:
+            os.makedirs('downloads', exist_ok=True)
+            cover_path = f"downloads/wh_{code}.jpg"
+            with open(cover_path, 'wb') as f:
+                f.write(img_res.content)
+            with open(cover_path, 'rb') as f:
+                await query.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard)
+            os.remove(cover_path)
+            await query.message.delete()
+        else:
+            await query.edit_message_text(f"❌ Failed to load cover.\n{caption}", reply_markup=keyboard, parse_mode='HTML', disable_web_page_preview=True)
+        return
+        
+    if data.startswith("wh_del_"):
+        code = data.split("_")[2]
+        wishlist = [i for i in wishlist if i['code'] != code]
+        save_wishlist(user_id, wishlist)
+        
+        keyboard = build_wh_keyboard(wishlist, 0)
+        # Check if the current message is a photo or text
+        if query.message.photo:
+            await query.message.delete()
+            await query.message.reply_text(
+                f"🗑️ <i>Removed {code} from wishlist.</i>\n\n📖 <b>Your Doujin Wishlist</b> (Page 1)",
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        else:
+            await query.edit_message_text(
+                f"🗑️ <i>Removed {code} from wishlist.</i>\n\n📖 <b>Your Doujin Wishlist</b> (Page 1)",
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        return
+
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     """Periodic cleanup of orphan files in downloads/"""
     if os.path.exists('downloads'):
@@ -503,6 +655,8 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
 
 from aiohttp import web
 
+from telegram.ext import CallbackQueryHandler
+
 async def main():
     if not TOKEN or TOKEN == 'your_bot_token_here':
         logger.error("Please set TELEGRAM_BOT_TOKEN")
@@ -512,8 +666,10 @@ async def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("adminmisuse", adminmisuse))
+    application.add_handler(CommandHandler("wh", wh_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(wh_callback, pattern="^wh_"))
 
     # Cleanup orphan files every 10 minutes
     application.job_queue.run_repeating(cleanup_job, interval=600, first=600)
