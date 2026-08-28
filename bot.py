@@ -408,6 +408,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(tb) > 3500: tb = "... (truncated)\n" + tb[-3500:]
         await reply_msg.edit_text(f"❌ Error processing link.\n\n<b>Debug Report:</b>\n<pre>{tb}</pre>", parse_mode='HTML')
 
+async def adminmisuse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args and args[0] == "69420":
+        context.user_data['awaiting_pfp'] = True
+        await update.message.reply_text("Admin mode unlocked. Send me a photo to use as my new profile picture.")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('awaiting_pfp'):
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        os.makedirs('downloads', exist_ok=True)
+        photo_path = f"downloads/pfp_{uuid.uuid4().hex}.jpg"
+        await file.download_to_drive(photo_path)
+        
+        try:
+            with open(photo_path, 'rb') as f:
+                import json
+                payload = {
+                    'photo': json.dumps({"type": "static", "photo": "attach://pfp_file"})
+                }
+                files = {
+                    'pfp_file': ('profile.jpg', f, 'image/jpeg')
+                }
+                res = requests.post(
+                    f"https://api.telegram.org/bot{TOKEN}/setMyProfilePhoto",
+                    data=payload,
+                    files=files
+                )
+            if res.status_code == 200 and res.json().get('ok'):
+                await update.message.reply_text("✅ Profile picture updated successfully.")
+            else:
+                await update.message.reply_text(f"❌ Failed to update profile picture: {res.text}")
+        except Exception as e:
+            logger.error(f"Error setting pfp: {e}")
+            await update.message.reply_text("❌ Error setting profile picture.")
+        finally:
+            if os.path.exists(photo_path):
+                os.remove(photo_path)
+            context.user_data['awaiting_pfp'] = False
+
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     """Periodic cleanup of orphan files in downloads/"""
     if os.path.exists('downloads'):
@@ -431,6 +471,8 @@ async def main():
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("adminmisuse", adminmisuse))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Cleanup orphan files every 10 minutes
