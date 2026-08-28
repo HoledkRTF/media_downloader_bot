@@ -579,11 +579,12 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("wh_page_"):
         page = int(data.split("_")[2])
         keyboard = build_wh_keyboard(wishlist, page)
-        await query.edit_message_text(
-            f"📖 <b>Your Doujin Wishlist</b> (Page {page+1})\n<i>Select a title to view details:</i>",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
+        text = f"📖 <b>Your Doujin Wishlist</b> (Page {page+1})\n<i>Select a title to view details:</i>"
+        if query.message.photo:
+            await query.message.delete()
+            await query.message.reply_text(text, reply_markup=keyboard, parse_mode='HTML')
+        else:
+            await query.edit_message_text(text, reply_markup=keyboard, parse_mode='HTML')
         return
         
     if data.startswith("wh_view_"):
