@@ -350,9 +350,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = nh_match.group(1)
         reply_msg = await update.message.reply_text("⏳ Fetching doujin info...")
         try:
-            import requests
+            import cloudscraper
             from bs4 import BeautifulSoup
-            r = await asyncio.to_thread(requests.get, f'https://nhentai.to/g/{code}', timeout=10)
+            scraper = cloudscraper.create_scraper()
+            r = await asyncio.to_thread(scraper.get, f'https://nhentai.net/g/{code}', timeout=10)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, 'html.parser')
                 cover_div = soup.find('div', id='cover')
@@ -379,7 +380,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     save_wishlist(user_id, wishlist)
                     
                     # Download cover
-                    img_res = await asyncio.to_thread(requests.get, cover_url, timeout=10)
+                    img_res = await asyncio.to_thread(scraper.get, cover_url, timeout=10)
                     if img_res.status_code == 200:
                         os.makedirs('downloads', exist_ok=True)
                         cover_path = f"downloads/nh_{code}.jpg"
@@ -603,8 +604,9 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # We can't edit a text message into a photo message directly, 
         # so we send a new photo message and delete the old menu message.
-        import requests
-        img_res = await asyncio.to_thread(requests.get, item['cover_url'], timeout=10)
+        import cloudscraper
+        scraper = cloudscraper.create_scraper()
+        img_res = await asyncio.to_thread(scraper.get, item['cover_url'], timeout=10)
         if img_res.status_code == 200:
             os.makedirs('downloads', exist_ok=True)
             cover_path = f"downloads/wh_{code}.jpg"
