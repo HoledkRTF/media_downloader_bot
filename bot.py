@@ -213,8 +213,6 @@ async def download_media(url: str):
             extracted_url, extracted_title = _fallback_twitter(url)
             if extracted_title == "ERROR_REGION_BLOCKED":
                 raise Exception("This specific video is blocked due to local regulations (regional restriction on Twitter).")
-            if extracted_title == "SCREENSHOT_SAVED":
-                raise Exception("SCREENSHOT_SAVED")
             if extracted_url:
                 target_url = extracted_url
             if extracted_title:
@@ -299,7 +297,7 @@ async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
     handles = []
     try:
-        # Check files for size limit. Any file > 50MB gets sent to Catbox instead.
+        # Check files for size limit. Any file > 50MB gets sent to Gofile instead.
         large_files = []
         valid_files = []
         for f in files:
@@ -308,7 +306,7 @@ async def send_album(message, files, as_files, caption=None):
             else:
                 valid_files.append(f)
         
-        # If there are large files, upload them to catbox and notify the user
+        # If there are large files, upload them to Gofile and notify the user
         for lf in large_files:
             await message.reply_text("⏳ A file in this album is over 50MB! Uploading the uncompressed original to Gofile...")
             cloud_link = upload_to_gofile(lf)
@@ -481,11 +479,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_msg.edit_text(f"❌ Could not download from this link.\n\n<b>Debug Report:</b>\n<pre>{safe_error}</pre>", parse_mode='HTML')
     except Exception as e:
         import traceback
-        if str(e) == "SCREENSHOT_SAVED" and os.path.exists("downloads/debug_twitter.png"):
-            with open("downloads/debug_twitter.png", 'rb') as f:
-                await update.message.reply_photo(photo=f, caption="❌ Playwright couldn't find the video. Here is what Render is seeing:")
-            return
-            
         logger.error(f"Error processing link: {e}")
         tb = traceback.format_exc().replace('<', '&lt;').replace('>', '&gt;')
         if len(tb) > 3500: tb = "... (truncated)\n" + tb[-3500:]
@@ -585,7 +578,7 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📖 <b>Your Doujin Wishlist</b> (Page {page+1})\n<i>Select a title to view details:</i>"
         if query.message.photo:
             await query.message.delete()
-            await query.message.reply_text(text, reply_markup=keyboard, parse_mode='HTML')
+            await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=keyboard, parse_mode='HTML')
         else:
             await query.edit_message_text(text, reply_markup=keyboard, parse_mode='HTML')
         return
@@ -599,6 +592,9 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         tags = item.get('tags', [])
         tag_str = ", ".join(tags) if tags else "No tags found"
+        if len(tag_str) > 800:
+            tag_str = tag_str[:797] + "..."
+            
         caption = (
             f"📖 <b>{item['title'].replace('<', '&lt;').replace('>', '&gt;')}</b>\n"
             f"🏷️ <b>Tags:</b> {tag_str}\n"
@@ -636,8 +632,9 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if the current message is a photo or text
         if query.message.photo:
             await query.message.delete()
-            await query.message.reply_text(
-                f"🗑️ <i>Removed {code} from wishlist.</i>\n\n📖 <b>Your Doujin Wishlist</b> (Page 1)",
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"🗑️ <i>Removed {code} from wishlist.</i>\n\n📖 <b>Your Doujin Wishlist</b> (Page 1)",
                 reply_markup=keyboard,
                 parse_mode='HTML'
             )
