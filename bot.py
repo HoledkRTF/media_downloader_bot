@@ -13,7 +13,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # Enable logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO,
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -659,6 +660,21 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
                 except:
                     pass
 
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    # Ensure this is somewhat protected (optional, maybe check against an admin ID if you have one)
+    if os.path.exists('bot.log'):
+        with open('bot.log', 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            # Get last 50 lines
+            recent_logs = "".join(lines[-50:])
+            # Truncate if too long for Telegram (4096 limit)
+            if len(recent_logs) > 4000:
+                recent_logs = "..." + recent_logs[-4000:]
+            await update.message.reply_text(f"📝 <b>Recent Logs:</b>\n<pre>{recent_logs.replace('<', '&lt;').replace('>', '&gt;')}</pre>", parse_mode='HTML')
+    else:
+        await update.message.reply_text("📭 No log file found.")
+
 from aiohttp import web
 
 from telegram.ext import CallbackQueryHandler
@@ -673,6 +689,7 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("adminmisuse", adminmisuse))
     application.add_handler(CommandHandler("wh", wh_command))
+    application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(wh_callback, pattern="^wh_"))
