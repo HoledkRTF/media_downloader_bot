@@ -143,24 +143,30 @@ async def download_media(url: str):
             media_urls = []
             if info.get('_type') == 'playlist' and 'entries' in info:
                 for entry in info.get('entries', []):
-                    if entry and entry.get('url'):
-                        media_urls.append(entry['url'])
-            elif info.get('url'):
-                media_urls.append(info['url'])
+                    if entry:
+                        if entry.get('url'):
+                            media_urls.append(entry['url'])
+                        elif entry.get('thumbnails'):
+                            media_urls.append(entry['thumbnails'][-1]['url'])
+            else:
+                if info.get('url'):
+                    media_urls.append(info['url'])
+                elif info.get('thumbnails'):
+                    media_urls.append(info['thumbnails'][-1]['url'])
 
             files = []
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
             os.makedirs('downloads', exist_ok=True)
             for m_url in media_urls:
-                if 'i.redd.it' in m_url or m_url.split('?')[0].endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                    m_res = requests.get(m_url, headers=headers)
-                    if m_res.status_code == 200:
-                        ext = m_url.split('.')[-1].split('?')[0]
-                        if len(ext) > 4: ext = 'jpg'
-                        filename = f"downloads/fallback_{uuid.uuid4().hex}.{ext}"
-                        with open(filename, 'wb') as f:
-                            f.write(m_res.content)
-                        files.append(filename)
+                # Removed strict extension check so Instagram image URLs work
+                m_res = requests.get(m_url, headers=headers)
+                if m_res.status_code == 200:
+                    ext = m_url.split('.')[-1].split('?')[0]
+                    if len(ext) > 4 or not ext: ext = 'jpg'
+                    filename = f"downloads/fallback_{uuid.uuid4().hex}.{ext}"
+                    with open(filename, 'wb') as f:
+                        f.write(m_res.content)
+                    files.append(filename)
             return files
         except Exception as e:
             logger.error(f"Fallback failed: {e}")
