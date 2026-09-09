@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-VERSION = "v1.4.2"
+VERSION = "v1.4.3"
 
 # Enable logging
 logging.basicConfig(
@@ -411,7 +411,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_msg.edit_text("❌ Could not fetch info for that code. It might not exist.")
         except Exception as e:
             logger.error(f"Error fetching nhentai: {e}")
-            await reply_msg.edit_text("❌ Error fetching doujin info.")
+            await reply_msg.edit_text(f"❌ Error fetching doujin info. ({VERSION})")
         return
 
     urls = re.findall(r'(https?://\S+)', text)
@@ -482,16 +482,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if os.path.exists(f):
                         os.remove(f)
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download Error: {e}")
-        safe_error = str(e).replace('<', '&lt;').replace('>', '&gt;')
-        if len(safe_error) > 3500: safe_error = safe_error[:3500] + "... (truncated)"
-        await reply_msg.edit_text(f"❌ Could not download from this link.\n\n<b>Debug Report:</b>\n<pre>{safe_error}</pre>", parse_mode='HTML')
+        logger.error(f"Download failed: {e}")
+        if hasattr(e, 'message'):
+            error_msg = e.message
+        else:
+            error_msg = str(e)
+        
+        # Truncate extremely long error messages
+        if len(error_msg) > 800:
+            error_msg = error_msg[:800] + "... [Truncated]"
+            
+        await reply_msg.edit_text(f"❌ Could not download from this link. ({VERSION})\n\n<b>Debug Report:</b>\n<pre>{error_msg}</pre>", parse_mode='HTML')
+        return
     except Exception as e:
         import traceback
-        logger.error(f"Error processing link: {e}")
+        logger.error(f"Error processing link: {e}\n{traceback.format_exc()}")
         tb = traceback.format_exc().replace('<', '&lt;').replace('>', '&gt;')
         if len(tb) > 3500: tb = "... (truncated)\n" + tb[-3500:]
-        await reply_msg.edit_text(f"❌ Error processing link.\n\n<b>Debug Report:</b>\n<pre>{tb}</pre>", parse_mode='HTML')
+        await reply_msg.edit_text(f"❌ Error processing link. ({VERSION})\n\n<b>Debug Report:</b>\n<pre>{tb}</pre>", parse_mode='HTML')
 
 async def adminmisuse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
