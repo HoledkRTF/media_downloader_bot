@@ -43,6 +43,7 @@ def save_wishlist(user_id, wishlist):
             with open('wishlist.json', 'r') as f:
                 data = json.load(f)
         data[str(user_id)] = wishlist
+        # ponytail: wishlist.json has no file locking, if throughput matters switch to sqlite
         with open('wishlist.json', 'w') as f:
             json.dump(data, f)
     except Exception as e:
@@ -175,8 +176,6 @@ async def download_media(url: str):
             return []
 
     def _fallback_twitter(url):
-        import requests
-        import re
         video_url = None
         title_text = None
         
@@ -289,7 +288,6 @@ def get_video_dimensions(filepath):
 
 def upload_to_gofile(filepath):
     """Upload large file to gofile.io and return direct link to the download page."""
-    import requests
     try:
         r = requests.get('https://api.gofile.io/servers')
         if r.status_code == 200:
@@ -517,7 +515,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             with open(photo_path, 'rb') as f:
-                import json
                 payload = {
                     'photo': json.dumps({"type": "static", "photo": "attach://pfp_file"})
                 }
@@ -681,9 +678,8 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ensure this is somewhat protected (optional, maybe check against an admin ID if you have one)
     if os.path.exists('bot.log'):
         with open('bot.log', 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            # Get last 50 lines
-            recent_logs = "".join(lines[-50:])
+            from collections import deque
+            recent_logs = "".join(deque(f, 50))
             # Truncate if too long for Telegram (4096 limit)
             if len(recent_logs) > 4000:
                 recent_logs = "..." + recent_logs[-4000:]
