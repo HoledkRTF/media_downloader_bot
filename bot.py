@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-VERSION = "v1.4.0"
+VERSION = "v1.4.1"
 
 # Enable logging
 logging.basicConfig(
@@ -134,9 +134,9 @@ async def download_media(url: str):
         # Add Instagram cookie if provided in .env to bypass the strict login wall
         ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
         if ig_cookie and ('instagram.com' in url or 'ig.me' in url):
-            with open('ig_cookies.txt', 'w') as f:
-                f.write(f"# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n")
-            ydl_opts['cookiefile'] = 'ig_cookies.txt'
+            ydl_opts['http_headers'] = {
+                'Cookie': f'sessionid={ig_cookie}'
+            }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -240,9 +240,9 @@ async def download_media(url: str):
         # Add Instagram cookie if provided in .env to bypass the strict login wall
         ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
         if ig_cookie and ('instagram.com' in url or 'ig.me' in url):
-            with open('ig_cookies.txt', 'w') as f:
-                f.write(f"# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n")
-            ydl_opts['cookiefile'] = 'ig_cookies.txt'
+            ydl_opts['http_headers'] = {
+                'Cookie': f'sessionid={ig_cookie}'
+            }
             
         os.makedirs('downloads', exist_ok=True)
         files = []
