@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+VERSION = "v1.4.0"
+
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO,
@@ -398,7 +400,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         with open(cover_path, 'wb') as f:
                             f.write(img_res.content)
                             
-                        caption = f"📖 <b>{title.replace('<', '&lt;').replace('>', '&gt;')}</b>\n🔗 <a href=\"https://nhentai.net/g/{code}\">nhentai.net/g/{code}</a>\n✅ <i>Saved to your /wh wishlist!</i>"
+                        caption = f"📖 <b>{title.replace('<', '&lt;').replace('>', '&gt;')}</b>\n🔗 <a href=\"https://nhentai.net/g/{code}\">nhentai.net/g/{code}</a>\n✅ <i>Saved to your /wh wishlist!</i>\n\n🤖 <i>{VERSION}</i>"
                         with open(cover_path, 'rb') as f:
                             await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
                             
@@ -467,11 +469,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 if os.path.exists(f):
                     os.remove(f)
-            await reply_msg.edit_text("✅ Done!")
+            await reply_msg.edit_text(f"✅ Done! ({VERSION})")
         else:
             try:
                 await send_album(update.message, files, as_files, caption)
-                await reply_msg.edit_text("✅ Done!")
+                await reply_msg.edit_text(f"✅ Done! ({VERSION})")
             except Exception as e:
                 logger.error(f"Failed to send album: {e}")
                 await reply_msg.edit_text(f"❌ Failed to send album.")
