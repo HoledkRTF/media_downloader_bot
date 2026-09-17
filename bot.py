@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-VERSION = "v1.7.1"
+VERSION = "v1.7.2"
 
 # Enable logging
 logging.basicConfig(

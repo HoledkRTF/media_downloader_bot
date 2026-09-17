@@ -7,3 +7,4 @@ aiohttp
 EbookLib
 bs4
 beautifulsoup4
+cloudscraper
