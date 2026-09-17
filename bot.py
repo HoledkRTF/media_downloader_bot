@@ -1,4 +1,6 @@
 import os
+import zipfile
+import io
 import asyncio
 import subprocess
 import yt_dlp
@@ -11,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-VERSION = "v1.4.3"
+VERSION = "v1.5.0"
 
 # Enable logging
 logging.basicConfig(
@@ -52,7 +54,9 @@ def save_wishlist(user_id, wishlist):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a link from Reddit, RedGifs, Twitter, or Instagram and I'll download the media for you.\n\n"
-        "Add -f after the link to receive files instead of media."
+        "Commands:\n"
+        "/manga <title> - Search & download manga chapters\n\n"
+        "Add -f after a link to receive files instead of media."
     )
 
 async def download_media(url: str):
@@ -691,6 +695,231 @@ from aiohttp import web
 
 from telegram.ext import CallbackQueryHandler
 
+# ── MangaDex Integration ──────────────────────────────────────────────
+
+MD_API = "https://api.mangadex.org"
+
+async def manga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /manga <title> command."""
+    if not context.args:
+        await update.message.reply_text(f"Usage: /manga <title>\nExample: /manga Overlord\n\n🤖 {VERSION}")
+        return
+
+    query = " ".join(context.args)
+    reply_msg = await update.message.reply_text(f"🔍 Searching MangaDex for '{query}'...")
+
+    try:
+        r = await asyncio.to_thread(
+            requests.get, f"{MD_API}/manga",
+            params={"title": query, "limit": 5, "includes[]": "cover_art",
+                    "contentRating[]": ["safe", "suggestive", "erotica", "pornographic"],
+                    "order[relevance]": "desc"},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+        )
+        data = r.json()
+        results = data.get("data", [])
+
+        if not results:
+            await reply_msg.edit_text(f"❌ No manga found for '{query}'. ({VERSION})")
+            return
+
+        keyboard = []
+        for m in results:
+            attrs = m["attributes"]
+            t = attrs["title"].get("en") or next(iter(attrs["title"].values()), "Unknown")
+            year = attrs.get("year") or "?"
+            status = (attrs.get("status") or "unknown").capitalize()
+            label = f"{t[:45]} ({year}, {status})"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"mg_sel_{m['id'][:30]}")])
+
+        await reply_msg.edit_text(
+            f"📚 <b>Results for '{query}':</b>\n<i>Select a manga:</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"MangaDex search error: {e}")
+        await reply_msg.edit_text(f"❌ Error searching MangaDex. ({VERSION})")
+
+
+def _build_chapter_keyboard(chapters, manga_id, page):
+    """Build paginated chapter list keyboard."""
+    PER_PAGE = 10
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    current = chapters[start:end]
+
+    keyboard = []
+    for ch in current:
+        attrs = ch["attributes"]
+        ch_num = attrs.get("chapter") or "?"
+        ch_title = attrs.get("title") or ""
+        label = f"Ch. {ch_num}"
+        if ch_title:
+            label += f" - {ch_title[:35]}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"mg_dl_{ch['id'][:30]}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mg_chp_{manga_id[:20]}_{page - 1}"))
+    if end < len(chapters):
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mg_chp_{manga_id[:20]}_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all mg_ callback buttons."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # ── User selected a manga from search results ──
+    if data.startswith("mg_sel_"):
+        manga_id = data[7:]
+        await query.edit_message_text("⏳ Loading chapters...")
+
+        try:
+            # Fetch English chapters sorted ascending
+            all_chapters = []
+            offset = 0
+            while True:
+                r = await asyncio.to_thread(
+                    requests.get, f"{MD_API}/manga/{manga_id}/feed",
+                    params={"translatedLanguage[]": "en", "limit": 100, "offset": offset,
+                            "order[chapter]": "asc", "contentRating[]": ["safe", "suggestive", "erotica", "pornographic"]},
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+                )
+                batch = r.json().get("data", [])
+                if not batch:
+                    break
+                all_chapters.extend(batch)
+                offset += 100
+                if offset >= r.json().get("total", 0):
+                    break
+
+            if not all_chapters:
+                await query.edit_message_text(f"❌ No English chapters found for this manga. ({VERSION})")
+                return
+
+            # Store chapters in user_data for pagination
+            context.user_data[f"mg_chapters_{manga_id}"] = all_chapters
+
+            keyboard = _build_chapter_keyboard(all_chapters, manga_id, 0)
+            await query.edit_message_text(
+                f"📖 <b>{len(all_chapters)} English chapters found.</b>\n<i>Select a chapter to download:</i>",
+                reply_markup=keyboard, parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"MangaDex chapter list error: {e}")
+            await query.edit_message_text(f"❌ Error loading chapters. ({VERSION})")
+        return
+
+    # ── Chapter pagination ──
+    if data.startswith("mg_chp_"):
+        parts = data[7:].rsplit("_", 1)
+        manga_id, page = parts[0], int(parts[1])
+        chapters = context.user_data.get(f"mg_chapters_{manga_id}", [])
+        if not chapters:
+            await query.edit_message_text("❌ Session expired. Please search again with /manga.")
+            return
+        keyboard = _build_chapter_keyboard(chapters, manga_id, page)
+        await query.edit_message_text(
+            f"📖 <b>{len(chapters)} English chapters found.</b>\n<i>Select a chapter to download:</i>",
+            reply_markup=keyboard, parse_mode="HTML"
+        )
+        return
+
+    # ── Download a specific chapter ──
+    if data.startswith("mg_dl_"):
+        chapter_id = data[6:]
+        await query.edit_message_text("⏳ Downloading chapter images...")
+
+        try:
+            # Get image server info
+            r = await asyncio.to_thread(
+                requests.get, f"{MD_API}/at-home/server/{chapter_id}",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+            )
+            srv = r.json()
+            base_url = srv["baseUrl"]
+            ch_hash = srv["chapter"]["hash"]
+            pages = srv["chapter"]["data"]
+
+            # Also get chapter metadata for naming
+            ch_r = await asyncio.to_thread(
+                requests.get, f"{MD_API}/chapter/{chapter_id}",
+                params={"includes[]": "manga"},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+            )
+            ch_data = ch_r.json().get("data", {})
+            ch_attrs = ch_data.get("attributes", {})
+            ch_num = ch_attrs.get("chapter") or "unknown"
+
+            # Try to get manga title from relationships
+            manga_title = "manga"
+            for rel in ch_data.get("relationships", []):
+                if rel["type"] == "manga" and "attributes" in rel:
+                    t_dict = rel["attributes"].get("title", {})
+                    manga_title = t_dict.get("en") or next(iter(t_dict.values()), "manga")
+                    break
+
+            # Download all page images into a .cbz (zip) in memory
+            os.makedirs("downloads", exist_ok=True)
+            safe_title = re.sub(r'[^\w\s-]', '', manga_title)[:50].strip()
+            cbz_filename = f"downloads/{safe_title}_Ch{ch_num}.cbz"
+
+            with zipfile.ZipFile(cbz_filename, "w", zipfile.ZIP_STORED) as zf:
+                for i, page_file in enumerate(pages):
+                    img_url = f"{base_url}/data/{ch_hash}/{page_file}"
+                    img_r = await asyncio.to_thread(
+                        requests.get, img_url,
+                        headers={"User-Agent": "Mozilla/5.0"}, timeout=30
+                    )
+                    if img_r.status_code == 200:
+                        ext = page_file.split(".")[-1]
+                        zf.writestr(f"{i+1:04d}.{ext}", img_r.content)
+
+                    # Update progress every 5 pages
+                    if (i + 1) % 5 == 0:
+                        try:
+                            await query.edit_message_text(f"⏳ Downloading... {i+1}/{len(pages)} pages")
+                        except Exception:
+                            pass
+
+            file_size = os.path.getsize(cbz_filename)
+            caption = f"📖 <b>{manga_title} - Chapter {ch_num}</b>\n📄 {len(pages)} pages\n\n🤖 <i>{VERSION}</i>"
+
+            if file_size > 50 * 1024 * 1024:
+                await query.edit_message_text("⏳ Chapter is over 50MB, uploading to Gofile...")
+                cloud_link = upload_to_gofile(cbz_filename)
+                if cloud_link:
+                    await query.edit_message_text(
+                        f"{caption}\n\n✅ File was too large for Telegram:\n🔗 {cloud_link}",
+                        parse_mode="HTML", disable_web_page_preview=True
+                    )
+                else:
+                    await query.edit_message_text(f"❌ Chapter too large and cloud upload failed. ({VERSION})")
+            else:
+                with open(cbz_filename, "rb") as f:
+                    await query.message.reply_document(
+                        document=f, filename=os.path.basename(cbz_filename),
+                        caption=caption, parse_mode="HTML"
+                    )
+                await query.edit_message_text(f"✅ Chapter {ch_num} sent! ({VERSION})")
+
+            if os.path.exists(cbz_filename):
+                os.remove(cbz_filename)
+
+        except Exception as e:
+            logger.error(f"MangaDex download error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await query.edit_message_text(f"❌ Error downloading chapter. ({VERSION})")
+        return
+
+
 async def main():
     if not TOKEN or TOKEN == 'your_bot_token_here':
         logger.error("Please set TELEGRAM_BOT_TOKEN")
@@ -702,9 +931,11 @@ async def main():
     application.add_handler(CommandHandler("adminmisuse", adminmisuse))
     application.add_handler(CommandHandler("wh", wh_command))
     application.add_handler(CommandHandler("logs", logs_command))
+    application.add_handler(CommandHandler("manga", manga_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(wh_callback, pattern="^wh_"))
+    application.add_handler(CallbackQueryHandler(manga_callback, pattern="^mg_"))
 
     # Cleanup orphan files every 10 minutes
     application.job_queue.run_repeating(cleanup_job, interval=600, first=600)
