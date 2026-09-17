@@ -730,7 +730,7 @@ async def manga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             year = attrs.get("year") or "?"
             status = (attrs.get("status") or "unknown").capitalize()
             label = f"{t[:45]} ({year}, {status})"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"mg_sel_{m['id'][:30]}")])
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"mg_sel_{m['id']}")])
 
         await reply_msg.edit_text(
             f"📚 <b>Results for '{query}':</b>\n<i>Select a manga:</i>",
@@ -756,13 +756,13 @@ def _build_chapter_keyboard(chapters, manga_id, page):
         label = f"Ch. {ch_num}"
         if ch_title:
             label += f" - {ch_title[:35]}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"mg_dl_{ch['id'][:30]}")])
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"mg_dl_{ch['id']}")])
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mg_chp_{manga_id[:20]}_{page - 1}"))
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mg_chp_{manga_id}_{page - 1}"))
     if end < len(chapters):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mg_chp_{manga_id[:20]}_{page + 1}"))
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mg_chp_{manga_id}_{page + 1}"))
     if nav:
         keyboard.append(nav)
 
