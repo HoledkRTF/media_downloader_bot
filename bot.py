@@ -10,10 +10,10 @@ import re
 import time
 import uuid
 from dotenv import load_dotenv
-from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-VERSION = "v1.6.0"
+VERSION = "v1.7.0"
 
 # Enable logging
 logging.basicConfig(
@@ -693,7 +693,204 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 from aiohttp import web
 
-from telegram.ext import CallbackQueryHandler
+# ── Light Novel Integration ──────────────────────────────────────────────
+
+async def ln_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /ln <title> command."""
+    if not context.args:
+        await update.message.reply_text(f"Usage: /ln <title>\nExample: /ln Overlord\n\n🤖 {VERSION}")
+        return
+
+    query = " ".join(context.args)
+    reply_msg = await update.message.reply_text(f"🔍 Searching AllNovelFull for '{query}'...")
+
+    try:
+        from bs4 import BeautifulSoup
+        r = await asyncio.to_thread(
+            requests.get, f"https://allnovelfull.com/search?keyword={query}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+        )
+        soup = BeautifulSoup(r.text, 'html.parser')
+        results = [a for h3 in soup.find_all('h3', class_='tit') for a in h3.find_all('a')]
+
+        if not results:
+            await reply_msg.edit_text(f"❌ No light novel found for '{query}'. ({VERSION})")
+            return
+
+        keyboard = []
+        if 'ln_search' not in context.user_data:
+            context.user_data['ln_search'] = {}
+            
+        for i, a in enumerate(results[:5]): # Top 5 results
+            label = a.text.strip()[:50]
+            link = a['href']
+            ch_id = str(uuid.uuid4())[:8] # short unique id
+            context.user_data['ln_search'][ch_id] = {'label': label, 'link': f"https://allnovelfull.com{link}"}
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"ln_sel_{ch_id}")])
+
+        await reply_msg.edit_text(
+            f"📚 <b>Results for '{query}':</b>\n<i>Select a novel:</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Light Novel search error: {e}")
+        await reply_msg.edit_text(f"❌ Error searching Light Novels. ({VERSION})")
+
+async def _fetch_ln_chapter(url, sem, loop):
+    async with sem:
+        from bs4 import BeautifulSoup
+        r = await loop.run_in_executor(None, lambda: requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}))
+        soup = BeautifulSoup(r.text, 'html.parser')
+        content = soup.find('div', class_='chapter-c')
+        title_el = soup.find('a', class_='chapter-title')
+        title = title_el.text.strip() if title_el else "Unknown Chapter"
+        return title, (content.decode_contents() if content else "")
+
+async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all ln_ callback buttons."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    from bs4 import BeautifulSoup
+    from ebooklib import epub
+
+    if data.startswith("ln_sel_"):
+        ch_id = data[7:]
+        search_data = context.user_data.get('ln_search', {}).get(ch_id)
+        if not search_data:
+            await query.edit_message_text("❌ Session expired. Please search again with /ln.")
+            return
+            
+        await query.edit_message_text("⏳ Loading novel details...")
+        
+        try:
+            r = await asyncio.to_thread(
+                requests.get, search_data['link'],
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+            )
+            
+            m = re.search(r'data-novel-id=[\'\"]([0-9]+)[\'\"]', r.text)
+            if not m:
+                await query.edit_message_text(f"❌ Error extracting novel ID. ({VERSION})")
+                return
+            novel_id = m.group(1)
+            
+            r_ch = await asyncio.to_thread(
+                requests.get, f"https://allnovelfull.com/ajax-chapter-option?novelId={novel_id}",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+            )
+            soup = BeautifulSoup(r_ch.text, 'html.parser')
+            options = soup.find_all('option')
+            
+            if not options:
+                await query.edit_message_text(f"❌ No chapters found. ({VERSION})")
+                return
+                
+            ch_urls = [f"https://allnovelfull.com{o['value']}" for o in options]
+            
+            # Store chapters for downloading
+            context.user_data[f"ln_chapters_{novel_id}"] = ch_urls
+            context.user_data[f"ln_title_{novel_id}"] = search_data['label']
+            
+            keyboard = [[InlineKeyboardButton(f"⬇️ Build EPUB ({len(ch_urls)} chapters)", callback_data=f"ln_dl_{novel_id}")]]
+            await query.edit_message_text(
+                f"📖 <b>{search_data['label']}</b>\n📄 {len(ch_urls)} chapters available.",
+                reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Light Novel chapter list error: {e}")
+            await query.edit_message_text(f"❌ Error loading chapters. ({VERSION})")
+        return
+
+    if data.startswith("ln_dl_"):
+        novel_id = data[6:]
+        ch_urls = context.user_data.get(f"ln_chapters_{novel_id}")
+        novel_title = context.user_data.get(f"ln_title_{novel_id}", "Novel")
+        
+        if not ch_urls:
+            await query.edit_message_text("❌ Session expired. Please search again with /ln.")
+            return
+
+        await query.edit_message_text(f"⏳ Building EPUB for {len(ch_urls)} chapters...\nThis will take a few minutes.")
+
+        try:
+            sem = asyncio.Semaphore(20)
+            loop = asyncio.get_running_loop()
+            
+            progress = {'done': 0, 'total': len(ch_urls)}
+            
+            async def wrapped_fetch(url):
+                res = await _fetch_ln_chapter(url, sem, loop)
+                progress['done'] += 1
+                if progress['done'] % 50 == 0 or progress['done'] == progress['total']:
+                    try:
+                        await query.edit_message_text(f"⏳ Downloading chapters... {progress['done']}/{progress['total']}")
+                    except Exception:
+                        pass
+                return res
+
+            tasks = [wrapped_fetch(url) for url in ch_urls]
+            results = await asyncio.gather(*tasks)
+            
+            await query.edit_message_text("⏳ Compiling EPUB file...")
+            
+            book = epub.EpubBook()
+            book.set_identifier(str(uuid.uuid4()))
+            book.set_title(novel_title)
+            book.set_language('en')
+            
+            spine = ['nav']
+            toc = []
+            
+            for i, (title, content) in enumerate(results):
+                ch = epub.EpubHtml(title=title, file_name=f'chap_{i}.xhtml')
+                ch.content = f'<h1>{title}</h1>{content}'
+                book.add_item(ch)
+                spine.append(ch)
+                toc.append(epub.Link(f'chap_{i}.xhtml', title, f'chap_{i}'))
+                
+            book.toc = tuple(toc)
+            book.add_item(epub.EpubNcx())
+            book.add_item(epub.EpubNav())
+            book.spine = spine
+            
+            os.makedirs("downloads", exist_ok=True)
+            safe_title = re.sub(r'[^\w\s-]', '', novel_title)[:50].strip()
+            epub_filename = f"downloads/{safe_title}.epub"
+            
+            epub.write_epub(epub_filename, book, {})
+            
+            file_size = os.path.getsize(epub_filename)
+            caption = f"📖 <b>{novel_title}</b>\n📄 {len(ch_urls)} chapters\n\n🤖 <i>{VERSION}</i>"
+
+            if file_size > 50 * 1024 * 1024:
+                await query.edit_message_text("⏳ EPUB is over 50MB, uploading to Gofile...")
+                cloud_link = upload_to_gofile(epub_filename)
+                if cloud_link:
+                    await query.edit_message_text(
+                        f"{caption}\n\n✅ File was too large for Telegram:\n🔗 {cloud_link}",
+                        parse_mode="HTML", disable_web_page_preview=True
+                    )
+                else:
+                    await query.edit_message_text(f"❌ EPUB too large and cloud upload failed. ({VERSION})")
+            else:
+                with open(epub_filename, "rb") as f:
+                    await query.message.reply_document(
+                        document=f, filename=os.path.basename(epub_filename),
+                        caption=caption, parse_mode="HTML"
+                    )
+                await query.edit_message_text(f"✅ Light Novel sent! ({VERSION})")
+
+            if os.path.exists(epub_filename):
+                os.remove(epub_filename)
+
+        except Exception as e:
+            logger.error(f"Light Novel download error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await query.edit_message_text(f"❌ Error building EPUB. ({VERSION})")
+        return
 
 # ── MangaKatana Integration ──────────────────────────────────────────────
 
@@ -912,10 +1109,12 @@ async def main():
     application.add_handler(CommandHandler("wh", wh_command))
     application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(CommandHandler("manga", manga_command))
+    application.add_handler(CommandHandler("ln", ln_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(wh_callback, pattern="^wh_"))
     application.add_handler(CallbackQueryHandler(manga_callback, pattern="^mg_"))
+    application.add_handler(CallbackQueryHandler(ln_callback, pattern="^ln_"))
 
     # Cleanup orphan files every 10 minutes
     application.job_queue.run_repeating(cleanup_job, interval=600, first=600)

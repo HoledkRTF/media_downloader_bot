@@ -4,4 +4,6 @@ curl_cffi
 requests
 python-dotenv
 aiohttp
+EbookLib
+bs4
 beautifulsoup4
