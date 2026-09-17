@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-VERSION = "v1.7.0"
+VERSION = "v1.7.1"
 
 # Enable logging
 logging.basicConfig(
@@ -706,9 +706,11 @@ async def ln_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         from bs4 import BeautifulSoup
+        import cloudscraper
+        scraper = cloudscraper.create_scraper()
         r = await asyncio.to_thread(
-            requests.get, f"https://allnovelfull.com/search?keyword={query}",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+            scraper.get, f"https://allnovelfull.com/search?keyword={query}",
+            timeout=15
         )
         soup = BeautifulSoup(r.text, 'html.parser')
         results = [a for h3 in soup.find_all('h3', class_='tit') for a in h3.find_all('a')]
@@ -739,7 +741,9 @@ async def ln_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _fetch_ln_chapter(url, sem, loop):
     async with sem:
         from bs4 import BeautifulSoup
-        r = await loop.run_in_executor(None, lambda: requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}))
+        import cloudscraper
+        scraper = cloudscraper.create_scraper()
+        r = await loop.run_in_executor(None, lambda: scraper.get(url))
         soup = BeautifulSoup(r.text, 'html.parser')
         content = soup.find('div', class_='chapter-c')
         title_el = soup.find('a', class_='chapter-title')
@@ -765,9 +769,11 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ Loading novel details...")
         
         try:
+            import cloudscraper
+            scraper = cloudscraper.create_scraper()
             r = await asyncio.to_thread(
-                requests.get, search_data['link'],
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+                scraper.get, search_data['link'],
+                timeout=15
             )
             
             m = re.search(r'data-novel-id=[\'\"]([0-9]+)[\'\"]', r.text)
@@ -777,8 +783,8 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             novel_id = m.group(1)
             
             r_ch = await asyncio.to_thread(
-                requests.get, f"https://allnovelfull.com/ajax-chapter-option?novelId={novel_id}",
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+                scraper.get, f"https://allnovelfull.com/ajax-chapter-option?novelId={novel_id}",
+                timeout=15
             )
             soup = BeautifulSoup(r_ch.text, 'html.parser')
             options = soup.find_all('option')
