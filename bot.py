@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-VERSION = "v1.7.4"
+VERSION = "v1.7.5"
 
 # Enable logging
 logging.basicConfig(
@@ -59,7 +59,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Add -f after a link to receive files instead of media."
     )
 
-async def download_media(url: str, media_index: int = None):
+async def download_media(url: str, media_indices: list = None):
     """Returns (files, title, original_url)"""
     title = None
     original_url = url
@@ -113,11 +113,12 @@ async def download_media(url: str, media_index: int = None):
                 else:
                     return [], m_url
 
-            if media_index is not None and media_index > 0:
-                if media_index <= len(media_urls):
-                    media_urls = [media_urls[media_index - 1]]
-                else:
-                    return [], None
+            if media_indices:
+                filtered_urls = []
+                for idx in media_indices:
+                    if idx > 0 and idx <= len(media_urls):
+                        filtered_urls.append(media_urls[idx - 1])
+                media_urls = filtered_urls
 
             files = []
             os.makedirs('downloads', exist_ok=True)
@@ -167,11 +168,12 @@ async def download_media(url: str, media_index: int = None):
                 elif info.get('thumbnails'):
                     media_urls.append(info['thumbnails'][-1]['url'])
 
-            if media_index is not None and media_index > 0:
-                if media_index <= len(media_urls):
-                    media_urls = [media_urls[media_index - 1]]
-                else:
-                    return []
+            if media_indices:
+                filtered_urls = []
+                for idx in media_indices:
+                    if idx > 0 and idx <= len(media_urls):
+                        filtered_urls.append(media_urls[idx - 1])
+                media_urls = filtered_urls
 
             files = []
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -252,8 +254,8 @@ async def download_media(url: str, media_index: int = None):
             'no_warnings': True,
         }
         
-        if media_index is not None and media_index > 0:
-            ydl_opts['playlist_items'] = str(media_index)
+        if media_indices:
+            ydl_opts['playlist_items'] = ','.join(str(idx) for idx in media_indices)
             
         # Add Instagram cookie if provided in .env to bypass the strict login wall
         ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
@@ -439,13 +441,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     as_files = bool(re.search(r'\s-f\b', text))
 
     clean_text = text.replace(url, '').replace('-f', '').strip()
-    match = re.search(r'^(\d+)$', clean_text) or re.search(r'\b(\d+)\b', clean_text)
-    media_index = int(match.group(1)) if match else None
+    
+    # Extract all standalone numbers for indices
+    media_indices = [int(n) for n in re.findall(r'\b(\d+)\b', clean_text)]
+    if not media_indices:
+        media_indices = None
 
     reply_msg = await update.message.reply_text("⏳ Processing link...")
 
     try:
-        files, title, original_url = await download_media(url, media_index)
+        files, title, original_url = await download_media(url, media_indices)
         if not files:
             await reply_msg.edit_text("❌ Couldn't find any media to download.")
             return
