@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-VERSION = "v1.7.5"
+VERSION = "v1.8.0"
 
 # Enable logging
 logging.basicConfig(
@@ -243,6 +243,26 @@ async def download_media(url: str, media_indices: list = None):
                 target_url = extracted_url
             if extracted_title:
                 title = extracted_title
+        elif 'tiktok.com' in url:
+            try:
+                # Use tikwm API to get 100% watermark-free raw video
+                res = requests.get(f"https://www.tikwm.com/api/?url={url}", timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get('data') and data['data'].get('play'):
+                        play_url = data['data']['play']
+                        title = data['data'].get('title', '')
+                        
+                        os.makedirs('downloads', exist_ok=True)
+                        m_res = requests.get(play_url, headers={'User-Agent': 'Mozilla/5.0'})
+                        if m_res.status_code == 200:
+                            filename = f"downloads/tiktok_{uuid.uuid4().hex}.mp4"
+                            with open(filename, 'wb') as f:
+                                f.write(m_res.content)
+                            return [filename]
+            except Exception as e:
+                logger.error(f"TikTok tikwm fallback failed: {e}")
+                # Fall through to yt-dlp if it fails
 
         ydl_opts = {
             'outtmpl': 'downloads/%(extractor)s_%(id)s.%(ext)s',
@@ -442,10 +462,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     clean_text = text.replace(url, '').replace('-f', '').strip()
     
-    # Extract all standalone numbers for indices
-    media_indices = [int(n) for n in re.findall(r'\b(\d+)\b', clean_text)]
-    if not media_indices:
-        media_indices = None
+    # Extract numbers and ranges for indices
+    media_indices = set()
+    for token in clean_text.split():
+        if re.match(r'^\d+$', token):
+            media_indices.add(int(token))
+        elif re.match(r'^\d+-\d+$', token):
+            try:
+                start, end = map(int, token.split('-'))
+                if start <= end and end - start < 100: # Prevent insane ranges
+                    media_indices.update(range(start, end + 1))
+            except:
+                pass
+                
+    media_indices = sorted(list(media_indices)) if media_indices else None
 
     reply_msg = await update.message.reply_text("⏳ Processing link...")
 
