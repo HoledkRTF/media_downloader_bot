@@ -12,8 +12,9 @@ import uuid
 from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
+from pymongo import MongoClient
 
-VERSION = "v1.9.4"
+VERSION = "v1.9.5"
 
 # Enable logging
 logging.basicConfig(
@@ -28,26 +29,45 @@ RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-2ia1
 
 import json
 
+MONGO_URI = os.environ.get('MONGO_URI')
+if MONGO_URI:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client['media_downloader']
+    wishlist_col = db['wishlist']
+else:
+    mongo_client = None
+
 def get_wishlist(user_id):
     try:
-        if os.path.exists('wishlist.json'):
-            with open('wishlist.json', 'r') as f:
-                data = json.load(f)
-                return data.get(str(user_id), [])
+        if mongo_client:
+            doc = wishlist_col.find_one({"_id": str(user_id)})
+            return doc.get('data', []) if doc else []
+        else:
+            if os.path.exists('wishlist.json'):
+                with open('wishlist.json', 'r') as f:
+                    data = json.load(f)
+                    return data.get(str(user_id), [])
     except Exception as e:
         logger.error(f"Error getting wishlist: {e}")
     return []
 
 def save_wishlist(user_id, wishlist):
     try:
-        data = {}
-        if os.path.exists('wishlist.json'):
-            with open('wishlist.json', 'r') as f:
-                data = json.load(f)
-        data[str(user_id)] = wishlist
-        # ponytail: wishlist.json has no file locking, if throughput matters switch to sqlite
-        with open('wishlist.json', 'w') as f:
-            json.dump(data, f)
+        if mongo_client:
+            wishlist_col.update_one(
+                {"_id": str(user_id)},
+                {"$set": {"data": wishlist}},
+                upsert=True
+            )
+        else:
+            data = {}
+            if os.path.exists('wishlist.json'):
+                with open('wishlist.json', 'r') as f:
+                    data = json.load(f)
+            data[str(user_id)] = wishlist
+            # ponytail: wishlist.json has no file locking, if throughput matters switch to sqlite
+            with open('wishlist.json', 'w') as f:
+                json.dump(data, f)
     except Exception as e:
         logger.error(f"Error saving wishlist: {e}")
 
