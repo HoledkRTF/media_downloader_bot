@@ -7,4 +7,5 @@ aiohttp
 EbookLib
 bs4
 beautifulsoup4
-cloudscraperpymongo
+cloudscraper
+pymongo
