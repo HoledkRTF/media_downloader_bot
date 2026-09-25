@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 
-VERSION = "v1.9.2"
+VERSION = "v1.9.3"
 
 # Enable logging
 logging.basicConfig(
@@ -398,14 +398,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check for forwarded channel/group message to set Vault
-    if update.message.forward_from_chat and update.message.forward_from_chat.type in ['channel', 'group', 'supergroup']:
-        chat_id = update.message.forward_from_chat.id
+    origin = update.message.forward_origin
+    if origin and origin.type in ['channel', 'chat'] and hasattr(origin, 'chat'):
+        chat_id = origin.chat.id
         user_id = update.message.from_user.id
         settings = get_wishlist('settings') or {}
         if str(user_id) not in settings: settings[str(user_id)] = {}
         settings[str(user_id)]['vault_id'] = chat_id
         save_wishlist('settings', settings)
-        chat_title = update.message.forward_from_chat.title
+        chat_title = origin.chat.title
         await update.message.reply_text(f"✅ Vault set to: {chat_title}!\nAny media you react to with a 👍 will be automatically forwarded there.")
         return
 
