@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 
-VERSION = "v1.9.1"
+VERSION = "v1.9.2"
 
 # Enable logging
 logging.basicConfig(
@@ -393,7 +393,7 @@ async def send_album(message, files, as_files, caption=None):
             h.close()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = update.message.text or update.message.caption
     if not text:
         return
 
@@ -1284,7 +1284,7 @@ async def main():
     application.add_handler(CommandHandler("manga", manga_command))
     application.add_handler(CommandHandler("ln", ln_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
     application.add_handler(MessageReactionHandler(reaction_callback))
     application.add_handler(CallbackQueryHandler(wh_callback, pattern="^wh_"))
     application.add_handler(CallbackQueryHandler(wh_callback, pattern="^nh_"))
@@ -1299,7 +1299,7 @@ async def main():
     await application.start()
     
     # Set Telegram Webhook to point to Render
-    await application.bot.set_webhook(url=f"{RENDER_URL}/webhook")
+    await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
 
     async def health_check(request):
         return web.Response(text="Bot is running!")
@@ -1308,7 +1308,7 @@ async def main():
         try:
             data = await request.json()
             update = Update.de_json(data, application.bot)
-            await application.update_queue.put(update)
+            await application.process_update(update)
             return web.Response()
         except Exception as e:
             logger.error(f"Error handling webhook: {e}")
