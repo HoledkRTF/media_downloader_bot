@@ -11,9 +11,9 @@ import time
 import uuid
 from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 
-VERSION = "v1.8.0"
+VERSION = "v1.9.0"
 
 # Enable logging
 logging.basicConfig(
@@ -397,6 +397,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # Check for forwarded channel message to set Vault
+    if update.message.forward_from_chat and update.message.forward_from_chat.type == 'channel':
+        chat_id = update.message.forward_from_chat.id
+        user_id = update.message.from_user.id
+        settings = get_wishlist('settings') or {}
+        if str(user_id) not in settings: settings[str(user_id)] = {}
+        settings[str(user_id)]['vault_id'] = chat_id
+        save_wishlist('settings', settings)
+        await update.message.reply_text(f"✅ Vault set to channel: {update.message.forward_from_chat.title}!\nAny media you react to with a 👍 will be automatically forwarded there.")
+        return
+
     # Check for nhentai 5-6 digit code
     nh_match = re.fullmatch(r'(\d{5,6})', text.strip())
     if nh_match:
@@ -440,8 +451,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f.write(img_res.content)
                             
                         caption = f"📖 <b>{title.replace('<', '&lt;').replace('>', '&gt;')}</b>\n🔗 <a href=\"https://nhentai.net/g/{code}\">nhentai.net/g/{code}</a>\n✅ <i>Saved to your /wh wishlist!</i>\n\n🤖 <i>{VERSION}</i>"
+                        
+                        keyboard = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⬇️ Download CBZ", callback_data=f"nh_dl_{code}")]
+                        ])
+                        
                         with open(cover_path, 'rb') as f:
-                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
+                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard)
                             
                         os.remove(cover_path)
                         await reply_msg.delete()
@@ -718,6 +734,73 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if data.startswith("nh_dl_"):
+        code = data.split("_")[2]
+        
+        # Don't fail if caption doesn't exist
+        original_caption = query.message.caption or ""
+        await query.edit_message_caption(caption=original_caption + "\n\n⏳ Downloading pages...")
+        
+        try:
+            from curl_cffi import requests as c_requests
+            from bs4 import BeautifulSoup
+            
+            r = await asyncio.to_thread(c_requests.get, f'https://nhentai.net/g/{code}/', impersonate='chrome110', timeout=10)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            
+            thumbs = soup.select('.gallerythumb img')
+            if not thumbs:
+                await query.edit_message_caption(caption=original_caption + "\n❌ Failed to find pages.")
+                return
+                
+            image_urls = []
+            for img in thumbs:
+                thumb_url = img.get('data-src') or img.get('src')
+                if thumb_url:
+                    full_url = re.sub(r'//t\d*\.', '//i.', thumb_url).replace('t.', '.')
+                    image_urls.append(full_url)
+                    
+            cbz_dir = f"downloads/nh_{code}"
+            os.makedirs(cbz_dir, exist_ok=True)
+            
+            async def fetch_page(idx, url, sem):
+                async with sem:
+                    img_res = await asyncio.to_thread(c_requests.get, url, impersonate='chrome110', timeout=15)
+                    if img_res.status_code == 200:
+                        ext = url.split('.')[-1]
+                        with open(f"{cbz_dir}/{idx:03d}.{ext}", 'wb') as f:
+                            f.write(img_res.content)
+                            
+            sem = asyncio.Semaphore(15)
+            tasks = [fetch_page(i, url, sem) for i, url in enumerate(image_urls, 1)]
+            await asyncio.gather(*tasks)
+            
+            cbz_path = f"downloads/nh_{code}.cbz"
+            with zipfile.ZipFile(cbz_path, 'w') as zf:
+                for f in os.listdir(cbz_dir):
+                    zf.write(os.path.join(cbz_dir, f), f)
+                    
+            if os.path.getsize(cbz_path) > 50 * 1024 * 1024:
+                await query.edit_message_caption(caption=original_caption + "\n⏳ File over 50MB, uploading to Gofile...")
+                cloud_link = upload_to_gofile(cbz_path)
+                if cloud_link:
+                    await query.edit_message_caption(caption=original_caption + f"\n✅ CBZ is too large for Telegram. Download here:\n🔗 {cloud_link}")
+                else:
+                    await query.edit_message_caption(caption=original_caption + "\n❌ Failed to upload large CBZ.")
+            else:
+                with open(cbz_path, 'rb') as f:
+                    await context.bot.send_document(chat_id=query.message.chat_id, document=f)
+                await query.edit_message_caption(caption=original_caption)
+                
+            import shutil
+            shutil.rmtree(cbz_dir, ignore_errors=True)
+            if os.path.exists(cbz_path): os.remove(cbz_path)
+            
+        except Exception as e:
+            logger.error(f"nHentai DL Error: {e}")
+            await query.edit_message_caption(caption=original_caption + "\n❌ Error downloading CBZ.")
+        return
+
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     """Periodic cleanup of orphan files in downloads/"""
     if os.path.exists('downloads'):
@@ -730,6 +813,38 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"Cleaned up orphan file {f_path}")
                 except:
                     pass
+
+async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward liked messages to the user's Vault."""
+    reaction = update.message_reaction
+    if not reaction: return
+    
+    has_like = any(r.type == 'emoji' and r.emoji in ['👍', '❤️', '🔥', '⭐'] for r in reaction.new_reaction)
+    if not has_like: return
+
+    user_id = reaction.user.id
+    settings = get_wishlist('settings') or {}
+    user_settings = settings.get(str(user_id), {})
+    vault_id = user_settings.get('vault_id')
+
+    if vault_id:
+        try:
+            await context.bot.forward_message(
+                chat_id=vault_id,
+                from_chat_id=reaction.chat_id,
+                message_id=reaction.message_id
+            )
+        except Exception as e:
+            logger.error(f"Vault forward failed: {e}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ Failed to forward to Vault. Make sure I am an admin in your Vault channel!"
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=user_id, 
+            text="You liked a message, but you haven't set up a Vault yet! Forward any message from a private Channel here to set it as your Vault."
+        )
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -1169,7 +1284,9 @@ async def main():
     application.add_handler(CommandHandler("ln", ln_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageReactionHandler(reaction_callback))
     application.add_handler(CallbackQueryHandler(wh_callback, pattern="^wh_"))
+    application.add_handler(CallbackQueryHandler(wh_callback, pattern="^nh_"))
     application.add_handler(CallbackQueryHandler(manga_callback, pattern="^mg_"))
     application.add_handler(CallbackQueryHandler(ln_callback, pattern="^ln_"))
 
