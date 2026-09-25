@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 
-VERSION = "v1.9.3"
+VERSION = "v1.9.4"
 
 # Enable logging
 logging.basicConfig(
@@ -821,26 +821,28 @@ async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reaction = update.message_reaction
     if not reaction: return
     
-    has_like = any(r.type == 'emoji' and r.emoji in ['👍', '❤️', '🔥', '⭐'] for r in reaction.new_reaction)
+    # Telegram sends the red heart without the variation selector (\uFE0F), so we include both variants
+    has_like = any(r.type == 'emoji' and r.emoji in ['👍', '❤️', '❤', '🔥', '⭐'] for r in reaction.new_reaction)
     if not has_like: return
 
-    user_id = reaction.user.id
+    user = reaction.user
+    user_id = user.id if user else reaction.chat.id
     settings = get_wishlist('settings') or {}
     user_settings = settings.get(str(user_id), {})
     vault_id = user_settings.get('vault_id')
 
     if vault_id:
         try:
-            await context.bot.forward_message(
+            await context.bot.copy_message(
                 chat_id=vault_id,
-                from_chat_id=reaction.chat_id,
+                from_chat_id=reaction.chat.id,
                 message_id=reaction.message_id
             )
         except Exception as e:
             logger.error(f"Vault forward failed: {e}")
             await context.bot.send_message(
                 chat_id=user_id,
-                text="❌ Failed to forward to Vault. Make sure I am an admin in your Vault channel!"
+                text="❌ Failed to forward to Vault. Make sure I am an admin in your Vault channel with the 'Post Messages' permission!"
             )
     else:
         await context.bot.send_message(
