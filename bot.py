@@ -14,7 +14,7 @@ from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocumen
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from pymongo import MongoClient
 
-VERSION = "v1.9.6"
+VERSION = "v1.9.7"
 
 # Enable logging
 logging.basicConfig(
@@ -86,12 +86,34 @@ def save_wishlist(user_id, wishlist):
         logger.error(f"Error saving wishlist: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send me a link from Reddit, RedGifs, Twitter, or Instagram and I'll download the media for you.\n\n"
-        "Commands:\n"
-        "/manga <title> - Search & download manga chapters\n\n"
-        "Add -f after a link to receive files instead of media."
+    msg = (
+        f"🤖 <b>Media Downloader Bot</b> <code>{VERSION}</code>\n\n"
+
+        "📥 <b>Download Media</b>\n"
+        "Send any link from Reddit, Twitter/X, RedGifs, Instagram, TikTok, "
+        "or most video sites and I'll grab the media for you.\n"
+        "• Add <code>-f</code> after a link to get raw files instead of compressed media\n"
+        "• For albums, add numbers to pick specific items: "
+        "<code>https://reddit.com/... 1 3 5</code>\n"
+        "• Use ranges too: <code>https://reddit.com/... 2-6</code>\n\n"
+
+        "📖 <b>Manga & Doujins</b>\n"
+        "/manga <code>&lt;title&gt;</code> — Search & download manga chapters as CBZ\n"
+        "Send a 5-6 digit code to look up & download from nhentai\n"
+        "/wh — View your saved doujin wishlist\n\n"
+
+        "📚 <b>Light Novels</b>\n"
+        "/ln <code>&lt;title&gt;</code> — Search & download light novels as EPUB\n\n"
+
+        "❤️ <b>Vault</b>\n"
+        "Forward a message from a private channel to set it as your Vault. "
+        "Then react to any message with 👍 or ❤️ to automatically save it there.\n\n"
+
+        "📊 <b>Stats & More</b>\n"
+        "/stats — View your download stats\n"
+        "/logs — View recent bot logs"
     )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def download_media(url: str, media_indices: list = None):
     """Returns (files, title, original_url)"""
