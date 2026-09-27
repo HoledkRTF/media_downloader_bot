@@ -14,7 +14,7 @@ from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocumen
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from pymongo import MongoClient
 
-VERSION = "v1.9.5"
+VERSION = "v1.9.6"
 
 # Enable logging
 logging.basicConfig(
@@ -34,8 +34,22 @@ if MONGO_URI:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client['media_downloader']
     wishlist_col = db['wishlist']
+    stats_col = db['stats']
 else:
     mongo_client = None
+
+def track_stat(user_id, field="downloads"):
+    if not mongo_client: return
+    from datetime import datetime, timezone
+    try:
+        stats_col.update_one(
+            {"_id": str(user_id)},
+            {"$inc": {field: 1}, "$set": {"last_active": datetime.now(timezone.utc).isoformat()},
+             "$setOnInsert": {"first_seen": datetime.now(timezone.utc).isoformat()}},
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"Error tracking stat {field}: {e}")
 
 def get_wishlist(user_id):
     try:
@@ -563,10 +577,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 if os.path.exists(f):
                     os.remove(f)
+            track_stat(update.message.from_user.id, "downloads")
             await reply_msg.edit_text(f"✅ Done! ({VERSION})")
         else:
             try:
                 await send_album(update.message, files, as_files, caption)
+                track_stat(update.message.from_user.id, "downloads")
                 await reply_msg.edit_text(f"✅ Done! ({VERSION})")
             except Exception as e:
                 logger.error(f"Failed to send album: {e}")
@@ -806,12 +822,14 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_caption(caption=original_caption + "\n⏳ File over 50MB, uploading to Gofile...")
                 cloud_link = upload_to_gofile(cbz_path)
                 if cloud_link:
+                    track_stat(query.from_user.id, "downloads")
                     await query.edit_message_caption(caption=original_caption + f"\n✅ CBZ is too large for Telegram. Download here:\n🔗 {cloud_link}")
                 else:
                     await query.edit_message_caption(caption=original_caption + "\n❌ Failed to upload large CBZ.")
             else:
                 with open(cbz_path, 'rb') as f:
                     await context.bot.send_document(chat_id=query.message.chat_id, document=f)
+                track_stat(query.from_user.id, "downloads")
                 await query.edit_message_caption(caption=original_caption)
                 
             import shutil
@@ -858,6 +876,7 @@ async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 from_chat_id=reaction.chat.id,
                 message_id=reaction.message_id
             )
+            track_stat(user_id, "vaults")
         except Exception as e:
             logger.error(f"Vault forward failed: {e}")
             await context.bot.send_message(
@@ -883,6 +902,31 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📝 <b>Recent Logs:</b>\n<pre>{recent_logs.replace('<', '&lt;').replace('>', '&gt;')}</pre>", parse_mode='HTML')
     else:
         await update.message.reply_text("📭 No log file found.")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if not mongo_client:
+        await update.message.reply_text("❌ Stats require a MongoDB database connection.")
+        return
+        
+    doc = stats_col.find_one({"_id": str(user_id)}) or {}
+    downloads = doc.get("downloads", 0)
+    vaults = doc.get("vaults", 0)
+    manga = doc.get("manga_downloads", 0)
+    ln = doc.get("ln_downloads", 0)
+    total = downloads + manga + ln
+    first_seen = doc.get("first_seen", "Today")
+    
+    msg = (
+        f"📊 <b>Your Stats</b>\n\n"
+        f"⬇️ Media downloads: <b>{downloads}</b>\n"
+        f"📖 Manga chapters: <b>{manga}</b>\n"
+        f"📚 Light novels: <b>{ln}</b>\n"
+        f"📦 Total downloads: <b>{total}</b>\n"
+        f"❤️ Vaulted items: <b>{vaults}</b>\n\n"
+        f"📅 Member since: <code>{first_seen[:10]}</code>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 from aiohttp import web
 
@@ -1076,6 +1120,7 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         document=f, filename=os.path.basename(epub_filename),
                         caption=caption, parse_mode="HTML"
                     )
+                track_stat(query.from_user.id, "ln_downloads")
                 await query.edit_message_text(f"✅ Light Novel sent! ({VERSION})")
 
             if os.path.exists(epub_filename):
@@ -1280,6 +1325,7 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         document=f, filename=os.path.basename(cbz_filename),
                         caption=caption, parse_mode="HTML"
                     )
+                track_stat(query.from_user.id, "manga_downloads")
                 await query.edit_message_text(f"✅ {ch_suffix} sent! ({VERSION})")
 
             if os.path.exists(cbz_filename):
@@ -1304,6 +1350,7 @@ async def main():
     application.add_handler(CommandHandler("adminmisuse", adminmisuse))
     application.add_handler(CommandHandler("wh", wh_command))
     application.add_handler(CommandHandler("logs", logs_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("manga", manga_command))
     application.add_handler(CommandHandler("ln", ln_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
