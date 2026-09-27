@@ -14,7 +14,7 @@ from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocumen
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from pymongo import MongoClient
 
-VERSION = "v1.9.7"
+VERSION = "v1.9.8"
 
 # Enable logging
 logging.basicConfig(
@@ -38,13 +38,37 @@ if MONGO_URI:
 else:
     mongo_client = None
 
-def track_stat(user_id, field="downloads"):
+def track_stat(user_id, field="downloads", url=None):
     if not mongo_client: return
     from datetime import datetime, timezone
     try:
+        inc_ops = {field: 1}
+        if url:
+            from urllib.parse import urlparse
+            import re
+            domain = urlparse(url).netloc.lower()
+            if 'reddit.com' in domain:
+                inc_ops["sources.reddit"] = 1
+                match = re.search(r'reddit\.com/r/([^/]+)', url, re.IGNORECASE)
+                if match:
+                    sub = match.group(1).lower()
+                    inc_ops[f"subreddits.{sub}"] = 1
+            elif 'twitter.com' in domain or 'x.com' in domain:
+                inc_ops["sources.twitter"] = 1
+            elif 'tiktok.com' in domain:
+                inc_ops["sources.tiktok"] = 1
+            elif 'instagram.com' in domain:
+                inc_ops["sources.instagram"] = 1
+            elif 'redgifs.com' in domain:
+                inc_ops["sources.redgifs"] = 1
+            elif 'nhentai.net' in domain:
+                pass # Already tracked as manga_downloads or similar
+            else:
+                inc_ops["sources.other"] = 1
+
         stats_col.update_one(
             {"_id": str(user_id)},
-            {"$inc": {field: 1}, "$set": {"last_active": datetime.now(timezone.utc).isoformat()},
+            {"$inc": inc_ops, "$set": {"last_active": datetime.now(timezone.utc).isoformat()},
              "$setOnInsert": {"first_seen": datetime.now(timezone.utc).isoformat()}},
             upsert=True
         )
@@ -599,12 +623,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 if os.path.exists(f):
                     os.remove(f)
-            track_stat(update.message.from_user.id, "downloads")
+            track_stat(update.message.from_user.id, "downloads", url=original_url)
             await reply_msg.edit_text(f"✅ Done! ({VERSION})")
         else:
             try:
                 await send_album(update.message, files, as_files, caption)
-                track_stat(update.message.from_user.id, "downloads")
+                track_stat(update.message.from_user.id, "downloads", url=original_url)
                 await reply_msg.edit_text(f"✅ Done! ({VERSION})")
             except Exception as e:
                 logger.error(f"Failed to send album: {e}")
@@ -939,13 +963,28 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = downloads + manga + ln
     first_seen = doc.get("first_seen", "Today")
     
+    sources = doc.get("sources", {})
+    source_msg = ""
+    if sources:
+        source_msg = "\n\n🌐 <b>Top Sources</b>\n"
+        for s, c in sorted(sources.items(), key=lambda x: x[1], reverse=True)[:3]:
+            source_msg += f"• {s.capitalize()}: {c}\n"
+            
+    subreddits = doc.get("subreddits", {})
+    sub_msg = ""
+    if subreddits:
+        sub_msg = "\n🤖 <b>Top Subreddits</b>\n"
+        for s, c in sorted(subreddits.items(), key=lambda x: x[1], reverse=True)[:3]:
+            sub_msg += f"• r/{s}: {c}\n"
+    
     msg = (
         f"📊 <b>Your Stats</b>\n\n"
         f"⬇️ Media downloads: <b>{downloads}</b>\n"
         f"📖 Manga chapters: <b>{manga}</b>\n"
         f"📚 Light novels: <b>{ln}</b>\n"
         f"📦 Total downloads: <b>{total}</b>\n"
-        f"❤️ Vaulted items: <b>{vaults}</b>\n\n"
+        f"❤️ Vaulted items: <b>{vaults}</b>"
+        f"{source_msg}{sub_msg}\n"
         f"📅 Member since: <code>{first_seen[:10]}</code>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
