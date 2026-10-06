@@ -14,7 +14,7 @@ from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocumen
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from pymongo import MongoClient
 
-VERSION = "v1.9.8"
+VERSION = "v1.9.9"
 
 # Enable logging
 logging.basicConfig(
@@ -129,9 +129,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📚 <b>Light Novels</b>\n"
         "/ln <code>&lt;title&gt;</code> — Search & download light novels as EPUB\n\n"
 
-        "❤️ <b>Vault</b>\n"
-        "Forward a message from a private channel to set it as your Vault. "
-        "Then react to any message with 👍 or ❤️ to automatically save it there.\n\n"
+        "❤️ <b>Vault & Anti-Censorship Cloak</b>\n"
+        "• Forward any media post from Telegram channels here to send an unlinked clean copy to your Vault (bypasses all channel blocks & bans)\n"
+        "• React to any downloaded media with 👍 or ❤️ to send it to your Vault\n"
+        "• /setvault — Set or update your private Vault channel\n\n"
 
         "📊 <b>Stats & More</b>\n"
         "/stats — View your download stats\n"
@@ -475,19 +476,6 @@ async def send_album(message, files, as_files, caption=None):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or update.message.caption
     if not text:
-        return
-
-    # Check for forwarded channel/group message to set Vault
-    origin = update.message.forward_origin
-    if origin and origin.type in ['channel', 'chat'] and hasattr(origin, 'chat'):
-        chat_id = origin.chat.id
-        user_id = update.message.from_user.id
-        settings = get_wishlist('settings') or {}
-        if str(user_id) not in settings: settings[str(user_id)] = {}
-        settings[str(user_id)]['vault_id'] = chat_id
-        save_wishlist('settings', settings)
-        chat_title = origin.chat.title
-        await update.message.reply_text(f"✅ Vault set to: {chat_title}!\nAny media you react to with a 👍 will be automatically forwarded there.")
         return
 
     # Check for nhentai 5-6 digit code
@@ -933,6 +921,107 @@ async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=user_id, 
             text="You liked a message, but you haven't set up a Vault yet! Forward any message from a private Channel here to set it as your Vault."
+        )
+
+async def setvault_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initiates setting or changing the user's Vault channel."""
+    context.user_data['awaiting_vault_setup'] = True
+    await update.message.reply_text(
+        "🛠️ <b>Set / Change Vault Channel</b>\n\n"
+        "1. Make sure I am an Administrator in your private channel with the <b>Post Messages</b> permission.\n"
+        "2. Forward any message from that channel to me right now, and I will lock it in as your Vault!",
+        parse_mode='HTML'
+    )
+
+async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle messages forwarded from channels/chats to save media to the Vault cleanly."""
+    message = update.message
+    if not message:
+        return
+
+    user_id = message.from_user.id
+    settings = get_wishlist('settings') or {}
+    user_settings = settings.get(str(user_id), {})
+    vault_id = user_settings.get('vault_id')
+
+    origin = message.forward_origin
+    text = (message.text or message.caption or "").strip()
+
+    # Check if user explicitly wants to set or update their Vault channel
+    is_vault_setup = (
+        context.user_data.get('awaiting_vault_setup')
+        or text.lower() == "/setvault"
+        or (not vault_id and origin and origin.type in ['channel', 'chat'])
+    )
+
+    if is_vault_setup and origin and origin.type in ['channel', 'chat'] and hasattr(origin, 'chat'):
+        chat_id = origin.chat.id
+        if str(user_id) not in settings:
+            settings[str(user_id)] = {}
+        settings[str(user_id)]['vault_id'] = chat_id
+        save_wishlist('settings', settings)
+        context.user_data.pop('awaiting_vault_setup', None)
+        chat_title = getattr(origin.chat, 'title', 'Channel')
+        await message.reply_text(
+            f"✅ <b>Vault set to: {chat_title}!</b>\n\n"
+            "From now on, any media you forward here (or react to with 👍/❤️) will be automatically sent to your Vault as a clean, standalone copy with zero channel tags or regional blocks.",
+            parse_mode='HTML'
+        )
+        return
+
+    # Check if this forwarded message has media (video, photo, doc, animation, audio, voice, video note)
+    has_media = bool(
+        message.video
+        or message.photo
+        or message.document
+        or message.animation
+        or message.audio
+        or message.voice
+        or message.video_note
+    )
+
+    # If it's a text-only message with a downloadable URL (Reddit, Twitter, etc.), pass to handle_message
+    if not has_media and text:
+        urls = re.findall(r'(https?://\S+)', text)
+        if urls:
+            await handle_message(update, context)
+            return
+
+    # If no media and no text, ignore
+    if not has_media and not text:
+        return
+
+    # User needs a Vault set up
+    if not vault_id:
+        await message.reply_text(
+            "❌ You haven't set up a Vault channel yet!\n\n"
+            "To set it up:\n"
+            "1. Create a private channel and add this bot as an Admin (with Post Messages permission).\n"
+            "2. Send any message in that channel, forward it to this bot, and it will be locked in as your Vault!"
+        )
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=vault_id,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id
+        )
+        track_stat(user_id, "vaults")
+
+        # Debounce confirmation reply for media albums (so user isn't spammed for each photo in an album)
+        media_group_id = message.media_group_id
+        if media_group_id:
+            if context.user_data.get('last_vaulted_group') != media_group_id:
+                context.user_data['last_vaulted_group'] = media_group_id
+                await message.reply_text("✅ Vaulted! Clean copy sent to your Vault channel (all channel tags and regional blocks removed).")
+        else:
+            await message.reply_text("✅ Vaulted! Clean copy sent to your Vault channel (all channel tags and regional blocks removed).")
+    except Exception as e:
+        logger.error(f"Forwarded vault copy failed: {e}")
+        await message.reply_text(
+            "❌ Failed to send to your Vault channel.\n"
+            "Make sure I am added as an Administrator in your Vault channel with the 'Post Messages' permission!"
         )
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1408,12 +1497,14 @@ async def main():
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setvault", setvault_command))
     application.add_handler(CommandHandler("adminmisuse", adminmisuse))
     application.add_handler(CommandHandler("wh", wh_command))
     application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("manga", manga_command))
     application.add_handler(CommandHandler("ln", ln_command))
+    application.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
     application.add_handler(MessageReactionHandler(reaction_callback))
