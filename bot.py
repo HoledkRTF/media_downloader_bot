@@ -14,7 +14,7 @@ from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocumen
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from pymongo import MongoClient
 
-VERSION = "v1.9.9"
+VERSION = "v2.0.0"
 
 # Enable logging
 logging.basicConfig(
@@ -147,6 +147,81 @@ async def download_media(url: str, media_indices: list = None):
 
     def _fallback_reddit(url):
         nonlocal title
+        # 1. Try vxreddit proxy to extract media and bypass Reddit's web block/JS challenges
+        try:
+            s = requests.Session()
+            headers = {'User-Agent': 'TelegramBot (like TwitterBot)'}
+            r = s.get(url, headers=headers, allow_redirects=True, timeout=10)
+            full_url = r.url.split('?')[0]
+
+            vx_url = re.sub(r'https?://(?:www\.)?reddit\.com', 'https://vxreddit.com', full_url)
+            r2 = s.get(vx_url, headers=headers, timeout=10)
+            if r2.status_code == 200:
+                soup = BeautifulSoup(r2.text, 'html.parser')
+                og_title = soup.find('meta', property='og:title')
+                if og_title:
+                    title = og_title.get('content')
+
+                # Check if description points to an external host (RedGifs, Imgur, etc.)
+                desc_meta = soup.find('meta', property='og:description')
+                if desc_meta:
+                    desc = desc_meta.get('content', '')
+                    ext_matches = re.findall(r'(https?://\S+)', desc)
+                    for match in ext_matches:
+                        if any(d in match for d in ['redgifs.com', 'imgur.com', 'gfycat.com']):
+                            return [], match
+
+                # Check for video streams
+                video_urls = []
+                for meta in soup.find_all('meta', property=re.compile(r'og:video(:url|:secure_url)?$')):
+                    c = meta.get('content')
+                    if c and c not in video_urls: video_urls.append(c)
+                for meta in soup.find_all('meta', attrs={'name': re.compile(r'twitter:player(:stream)?$')}):
+                    c = meta.get('content')
+                    if c and c not in video_urls: video_urls.append(c)
+
+                if video_urls:
+                    return [], video_urls[0]
+
+                # Check for gallery / single images
+                image_urls = []
+                for meta in soup.find_all('meta', property='og:image'):
+                    c = meta.get('content')
+                    if c and 'preview.redd.it' not in c and 'external-preview' not in c:
+                        if c not in image_urls: image_urls.append(c)
+                if not image_urls:
+                    for meta in soup.find_all('meta', property='og:image'):
+                        c = meta.get('content')
+                        if c and c not in image_urls: image_urls.append(c)
+
+                if image_urls:
+                    if media_indices:
+                        filtered = []
+                        for idx in media_indices:
+                            if 0 < idx <= len(image_urls):
+                                filtered.append(image_urls[idx - 1])
+                        image_urls = filtered
+
+                    files = []
+                    os.makedirs('downloads', exist_ok=True)
+                    for m_url in image_urls:
+                        m_res = s.get(m_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+                        if m_res.status_code == 200:
+                            ct = m_res.headers.get('content-type', '').lower()
+                            if 'html' in ct or 'text' in ct:
+                                continue
+                            ext = m_url.split('.')[-1].split('?')[0]
+                            if len(ext) > 4 or not ext: ext = 'jpg'
+                            fname = f'downloads/reddit_{uuid.uuid4().hex}.{ext}'
+                            with open(fname, 'wb') as f:
+                                f.write(m_res.content)
+                            files.append(fname)
+                    if files:
+                        return files, None
+        except Exception as e:
+            logger.error(f"vxreddit fallback failed: {e}")
+
+        # 2. Fallback to direct Reddit JSON API as secondary backup
         try:
             s = requests.Session()
             s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
@@ -206,6 +281,9 @@ async def download_media(url: str, media_indices: list = None):
             for m_url, ext in media_urls:
                 m_res = s.get(m_url)
                 if m_res.status_code == 200:
+                    ct = m_res.headers.get('content-type', '').lower()
+                    if 'html' in ct or 'text' in ct:
+                        continue
                     filename = f"downloads/reddit_{uuid.uuid4().hex}.{ext}"
                     with open(filename, 'wb') as f:
                         f.write(m_res.content)
@@ -260,9 +338,11 @@ async def download_media(url: str, media_indices: list = None):
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
             os.makedirs('downloads', exist_ok=True)
             for m_url in media_urls:
-                # Removed strict extension check so Instagram image URLs work
                 m_res = requests.get(m_url, headers=headers)
                 if m_res.status_code == 200:
+                    ct = m_res.headers.get('content-type', '').lower()
+                    if 'html' in ct or 'text' in ct:
+                        continue
                     ext = m_url.split('.')[-1].split('?')[0]
                     if len(ext) > 4 or not ext: ext = 'jpg'
                     filename = f"downloads/fallback_{uuid.uuid4().hex}.{ext}"
@@ -606,7 +686,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Failed to send file: {e}")
-                await reply_msg.edit_text(f"❌ Failed to send file to Telegram.")
+                await reply_msg.edit_text(f"❌ Failed to send file to Telegram: {e}")
                 return
             finally:
                 if os.path.exists(f):
