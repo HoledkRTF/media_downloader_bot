@@ -9,13 +9,14 @@ import requests
 import re
 import time
 import uuid
+import html
 from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.0.1"
+VERSION = "v2.1.0"
 
 # Enable logging
 logging.basicConfig(
@@ -140,6 +141,56 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/logs — View recent bot logs"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
+
+def fetch_twitter_details(url):
+    match = re.search(r'status/(\d+)', url)
+    if not match:
+        return None
+    tweet_id = match.group(1)
+    api_url = f"https://api.vxtwitter.com/Twitter/status/{tweet_id}"
+    try:
+        res = requests.get(api_url, headers={'User-Agent': 'TelegramBot (like TwitterBot)'}, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('hasMedia'):
+                items = []
+                for media in data.get('media_extended', []):
+                    m_type = media.get('type')
+                    m_url = media.get('url')
+                    full_res = m_url
+                    if m_type == 'image' and 'pbs.twimg.com' in m_url:
+                        base = m_url.split('?')[0]
+                        full_res = base + '?name=orig'
+                    items.append({
+                        'type': m_type,
+                        'url': m_url,
+                        'full_res': full_res,
+                        'width': media.get('size', {}).get('width'),
+                        'height': media.get('size', {}).get('height')
+                    })
+                if not items and data.get('mediaURLs'):
+                    for u in data['mediaURLs']:
+                        is_vid = any(u.endswith(ext) for ext in ('.mp4', '.m3u8'))
+                        full_res = u
+                        if not is_vid and 'pbs.twimg.com' in u:
+                            full_res = u.split('?')[0] + '?name=orig'
+                        items.append({
+                            'type': 'video' if is_vid else 'image',
+                            'url': u,
+                            'full_res': full_res
+                        })
+                return {
+                    'title': data.get('text', ''),
+                    'user_name': data.get('user_name', ''),
+                    'user_screen_name': data.get('user_screen_name', ''),
+                    'tweet_url': f"https://x.com/{data.get('user_screen_name', 'i')}/status/{tweet_id}",
+                    'items': items
+                }
+        elif res.status_code == 404:
+            return "ERROR_REGION_BLOCKED"
+    except Exception as e:
+        logger.error(f"vxtwitter API error in fetch_twitter_details: {e}")
+    return None
 
 async def download_media(url: str, media_indices: list = None):
     """Returns (files, title, original_url)"""
@@ -356,37 +407,19 @@ async def download_media(url: str, media_indices: list = None):
             return []
 
     def _fallback_twitter(url):
-        video_url = None
-        title_text = None
-        
-        try:
-            # Extract tweet ID
-            match = re.search(r'status/(\d+)', url)
-            if not match:
-                return None, None
-                
-            tweet_id = match.group(1)
-            api_url = f"https://api.vxtwitter.com/Twitter/status/{tweet_id}"
-            
-            res = requests.get(api_url, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('hasMedia') and data.get('mediaURLs'):
-                    # Find highest quality video or just take the first video URL
-                    for media in data.get('media_extended', []):
-                        if media.get('type') == 'video':
-                            video_url = media.get('url')
-                            break
-                    if not video_url:
-                        video_url = data['mediaURLs'][0]
-                    title_text = data.get('text', '')
-            elif res.status_code == 404:
-                return None, "ERROR_REGION_BLOCKED"
-                
-        except Exception as e:
-            logger.error(f"vxtwitter API error: {e}")
-            
-        return video_url, title_text
+        data = fetch_twitter_details(url)
+        if data == "ERROR_REGION_BLOCKED":
+            return None, "ERROR_REGION_BLOCKED"
+        if data and data.get('items'):
+            v_url = None
+            for it in data['items']:
+                if it.get('type') in ('video', 'gif'):
+                    v_url = it.get('url')
+                    break
+            if not v_url:
+                v_url = data['items'][0].get('url')
+            return v_url, data.get('title')
+        return None, None
 
     def _download():
         nonlocal title
@@ -645,6 +678,106 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     media_indices = sorted(list(media_indices)) if media_indices else None
 
     reply_msg = await update.message.reply_text("⏳ Processing link...")
+
+    # Fast zero-bandwidth passthrough for Twitter / X links
+    is_twitter = ('twitter.com' in url or 'x.com' in url)
+    if is_twitter and not as_files:
+        try:
+            tw_data = await asyncio.to_thread(fetch_twitter_details, url)
+            if tw_data == "ERROR_REGION_BLOCKED":
+                await reply_msg.edit_text(f"❌ This specific video is blocked due to local regulations (regional restriction on Twitter). ({VERSION})")
+                return
+            if tw_data and tw_data.get('items'):
+                items = tw_data['items']
+                if media_indices:
+                    filtered = []
+                    for idx in media_indices:
+                        if 1 <= idx <= len(items):
+                            filtered.append(items[idx - 1])
+                    if filtered:
+                        items = filtered
+
+                title = tw_data.get('title', '')
+                caption_parts = []
+                if title:
+                    safe_title = title.replace('<', '&lt;').replace('>', '&gt;')
+                    caption_parts.append(safe_title[:700])
+
+                author = tw_data.get('user_screen_name')
+                author_label = f"@{author}" if author else "Tweet"
+                caption_parts.append(f'🔗 <a href="{tw_data.get("tweet_url", url)}">{author_label}</a>')
+
+                # Single photo via URL passthrough
+                if len(items) == 1 and items[0]['type'] == 'image':
+                    item = items[0]
+                    caption_parts.append(f'📥 <a href="{item["full_res"]}">Direct Full-Res File</a>')
+                    caption = "\n\n".join(caption_parts)
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
+                    ])
+                    await update.message.reply_photo(
+                        photo=item['url'],
+                        caption=caption,
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                    track_stat(update.message.from_user.id, "downloads", url=url)
+                    await reply_msg.delete()
+                    return
+
+                # Single video via URL passthrough
+                elif len(items) == 1 and items[0]['type'] in ('video', 'gif'):
+                    item = items[0]
+                    caption_parts.append(f'📥 <a href="{item["full_res"]}">Direct Full-Res File</a>')
+                    caption = "\n\n".join(caption_parts)
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
+                    ])
+                    v_kwargs = {'supports_streaming': True}
+                    if item.get('width'): v_kwargs['width'] = item['width']
+                    if item.get('height'): v_kwargs['height'] = item['height']
+                    try:
+                        await update.message.reply_video(
+                            video=item['url'],
+                            caption=caption,
+                            parse_mode='HTML',
+                            reply_markup=keyboard,
+                            **v_kwargs
+                        )
+                        track_stat(update.message.from_user.id, "downloads", url=url)
+                        await reply_msg.delete()
+                        return
+                    except Exception as e:
+                        logger.warning(f"Direct video URL send failed (likely >20MB limit): {e}, falling back to yt-dlp")
+
+                # Photo album via URL passthrough
+                elif all(m['type'] == 'image' for m in items):
+                    try:
+                        media_group = []
+                        for idx, m in enumerate(items):
+                            if idx == 0:
+                                cap = "\n\n".join(caption_parts)
+                                media_group.append(InputMediaPhoto(media=m['url'], caption=cap, parse_mode='HTML'))
+                            else:
+                                media_group.append(InputMediaPhoto(media=m['url']))
+
+                        for chunk in chunk_list(media_group, 10):
+                            await update.message.reply_media_group(media=chunk)
+
+                        buttons = []
+                        for idx, m in enumerate(items):
+                            buttons.append(InlineKeyboardButton(f"📥 Photo {idx+1} Full-Res", url=m['full_res']))
+                        btn_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+                        ctrl_caption = f"📸 <b>Album ({len(items)} photos)</b> • Tap below for uncompressed files:"
+                        await update.message.reply_text(ctrl_caption, reply_markup=InlineKeyboardMarkup(btn_rows), parse_mode='HTML')
+
+                        track_stat(update.message.from_user.id, "downloads", url=url)
+                        await reply_msg.delete()
+                        return
+                    except Exception as e:
+                        logger.warning(f"Direct album send failed: {e}, falling back to yt-dlp")
+        except Exception as e:
+            logger.warning(f"Zero-bandwidth Twitter extraction failed: {e}, falling back to standard downloader")
 
     try:
         files, title, original_url = await download_media(url, media_indices)
