@@ -1600,43 +1600,52 @@ async def main():
     await application.initialize()
     await application.start()
     
-    # Set Telegram Webhook to point to Render
-    await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
+    is_render = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+    if is_render:
+        # Set Telegram Webhook to point to Render
+        await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
 
-    async def health_check(request):
-        return web.Response(text="Bot is running!")
+        async def health_check(request):
+            return web.Response(text="Bot is running!")
 
-    async def telegram_webhook(request):
-        try:
-            data = await request.json()
-            update = Update.de_json(data, application.bot)
-            await application.process_update(update)
-            return web.Response()
-        except Exception as e:
-            logger.error(f"Error handling webhook: {e}")
-            return web.Response(status=500)
+        async def telegram_webhook(request):
+            try:
+                data = await request.json()
+                update = Update.de_json(data, application.bot)
+                await application.process_update(update)
+                return web.Response()
+            except Exception as e:
+                logger.error(f"Error handling webhook: {e}")
+                return web.Response(status=500)
 
-    # Setup aiohttp web server
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_post("/webhook", telegram_webhook)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    port = int(os.environ.get('PORT', 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    logger.info(f"Webhook server started on port {port}. Health check on /")
-    
+        # Setup aiohttp web server
+        app = web.Application()
+        app.router.add_get("/", health_check)
+        app.router.add_post("/webhook", telegram_webhook)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        port = int(os.environ.get('PORT', 10000))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        logger.info(f"Webhook server started on port {port}. Health check on /")
+    else:
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        await application.updater.start_polling(allowed_updates=["message", "callback_query", "message_reaction"])
+        logger.info(f"Bot {VERSION} started in POLLING mode locally!")
+
     try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
         pass
     finally:
+        if not is_render and application.updater and application.updater.running:
+            await application.updater.stop()
         await application.stop()
+        await application.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
