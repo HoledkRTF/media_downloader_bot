@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.0.0"
+VERSION = "v2.0.1"
 
 # Enable logging
 logging.basicConfig(
