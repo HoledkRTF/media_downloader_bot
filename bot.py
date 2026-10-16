@@ -13,10 +13,11 @@ import html
 from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
+from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.1.0"
+VERSION = "v2.1.1"
 
 # Enable logging
 logging.basicConfig(
@@ -568,7 +569,7 @@ async def send_album(message, files, as_files, caption=None):
                 handles.append(handle)
                 group.append(InputMediaDocument(handle, caption=caption if i == 0 else None, parse_mode='HTML' if caption else None))
             for chunk in chunk_list(group, 10):
-                await message.reply_media_group(media=chunk)
+                await message.reply_media_group(media=chunk, read_timeout=300, write_timeout=300)
         else:
             group = []
             for i, f in enumerate(valid_files):
@@ -582,7 +583,7 @@ async def send_album(message, files, as_files, caption=None):
                 else:
                     group.append(InputMediaPhoto(handle, caption=cap, parse_mode=pm))
             for chunk in chunk_list(group, 10):
-                await message.reply_media_group(media=chunk)
+                await message.reply_media_group(media=chunk, read_timeout=300, write_timeout=300)
     finally:
         for h in handles:
             h.close()
@@ -810,16 +811,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             
                     with open(f, 'rb') as doc:
                         if as_files:
-                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML')
+                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
                         elif f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
                             w, h = get_video_dimensions(f)
-                            await update.message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True)
+                            await update.message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, read_timeout=300, write_timeout=300)
                         elif f.endswith(('.jpg', '.png', '.jpeg')):
-                            await update.message.reply_photo(photo=doc, caption=caption, parse_mode='HTML')
+                            await update.message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
                         else:
-                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML')
+                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
             except Exception as e:
                 logger.error(f"Failed to send file: {e}")
+                if ("timed out" in str(e).lower() or "timeout" in str(e).lower()) and not as_files:
+                    try:
+                        logger.info("Upload timed out, retrying send as document...")
+                        with open(f, 'rb') as doc:
+                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
+                        track_stat(update.message.from_user.id, "downloads", url=original_url)
+                        await reply_msg.edit_text(f"✅ Done! ({VERSION})")
+                        return
+                    except Exception as retry_e:
+                        logger.error(f"Retry as document failed: {retry_e}")
                 await reply_msg.edit_text(f"❌ Failed to send file to Telegram: {e}")
                 return
             finally:
@@ -1708,7 +1719,14 @@ async def main():
         logger.error("Please set TELEGRAM_BOT_TOKEN")
         return
 
-    application = Application.builder().token(TOKEN).build()
+    request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=60.0,
+        read_timeout=300.0,
+        write_timeout=300.0,
+        pool_timeout=60.0
+    )
+    application = Application.builder().token(TOKEN).request(request).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setvault", setvault_command))
