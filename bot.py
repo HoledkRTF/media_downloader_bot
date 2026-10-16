@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.1.1"
+VERSION = "v2.2.0"
 
 # Enable logging
 logging.basicConfig(
@@ -38,8 +38,10 @@ if MONGO_URI:
     db = mongo_client['media_downloader']
     wishlist_col = db['wishlist']
     stats_col = db['stats']
+    retry_col = db['retry_queue']
 else:
     mongo_client = None
+    retry_col = None
 
 def track_stat(user_id, field="downloads", url=None):
     if not mongo_client: return
@@ -112,6 +114,89 @@ def save_wishlist(user_id, wishlist):
     except Exception as e:
         logger.error(f"Error saving wishlist: {e}")
 
+def get_failed_queue(user_id):
+    try:
+        if mongo_client and retry_col is not None:
+            doc = retry_col.find_one({"_id": str(user_id)})
+            return doc.get('items', []) if doc else []
+        else:
+            if os.path.exists('retry_queue.json'):
+                with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data.get(str(user_id), [])
+    except Exception as e:
+        logger.error(f"Error getting retry queue: {e}")
+    return []
+
+def add_failed_download(user_id, url, raw_text, reason=None):
+    from datetime import datetime, timezone
+    try:
+        items = get_failed_queue(user_id)
+        # Avoid duplicate URLs, move latest attempt to top
+        items = [i for i in items if i.get('url') != url]
+        items.insert(0, {
+            "url": url,
+            "raw_text": raw_text,
+            "reason": str(reason)[:200] if reason else "Download failed",
+            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        })
+        items = items[:50]
+        if mongo_client and retry_col is not None:
+            retry_col.update_one(
+                {"_id": str(user_id)},
+                {"$set": {"items": items}},
+                upsert=True
+            )
+        else:
+            data = {}
+            if os.path.exists('retry_queue.json'):
+                with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            data[str(user_id)] = items
+            with open('retry_queue.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        logger.info(f"Added {url} to retry queue for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error adding to retry queue: {e}")
+
+def remove_failed_download(user_id, url):
+    try:
+        items = get_failed_queue(user_id)
+        new_items = [i for i in items if i.get('url') != url]
+        if len(new_items) == len(items):
+            return
+        if mongo_client and retry_col is not None:
+            retry_col.update_one(
+                {"_id": str(user_id)},
+                {"$set": {"items": new_items}},
+                upsert=True
+            )
+        else:
+            data = {}
+            if os.path.exists('retry_queue.json'):
+                with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            data[str(user_id)] = new_items
+            with open('retry_queue.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        logger.info(f"Removed {url} from retry queue for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error removing from retry queue: {e}")
+
+def clear_failed_queue(user_id):
+    try:
+        if mongo_client and retry_col is not None:
+            retry_col.delete_one({"_id": str(user_id)})
+        else:
+            if os.path.exists('retry_queue.json'):
+                with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                data.pop(str(user_id), None)
+                with open('retry_queue.json', 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error clearing retry queue: {e}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"🤖 <b>Media Downloader Bot</b> <code>{VERSION}</code>\n\n"
@@ -122,7 +207,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Add <code>-f</code> after a link to get raw files instead of compressed media\n"
         "• For albums, add numbers to pick specific items: "
         "<code>https://reddit.com/... 1 3 5</code>\n"
-        "• Use ranges too: <code>https://reddit.com/... 2-6</code>\n\n"
+        "• Use ranges too: <code>https://reddit.com/... 2-6</code>\n"
+        "• /retry — Retry any previously failed downloads (/retry list, /retry clear)\n\n"
 
         "📖 <b>Manga & Doujins</b>\n"
         "/manga <code>&lt;title&gt;</code> — Search & download manga chapters as CBZ\n"
@@ -654,9 +740,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_msg.edit_text(f"❌ Error fetching doujin info. ({VERSION})")
         return
 
+    return await process_media_request(update.message, text, update.message.from_user.id)
+
+async def process_media_request(message, text: str, user_id: int) -> bool:
     urls = re.findall(r'(https?://\S+)', text)
     if not urls:
-        return
+        return False
 
     url = urls[0]
     as_files = bool(re.search(r'\s-f\b', text))
@@ -671,14 +760,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif re.match(r'^\d+-\d+$', token):
             try:
                 start, end = map(int, token.split('-'))
-                if start <= end and end - start < 100: # Prevent insane ranges
+                if start <= end and end - start < 100:
                     media_indices.update(range(start, end + 1))
             except:
                 pass
                 
     media_indices = sorted(list(media_indices)) if media_indices else None
 
-    reply_msg = await update.message.reply_text("⏳ Processing link...")
+    reply_msg = await message.reply_text("⏳ Processing link...")
 
     # Fast zero-bandwidth passthrough for Twitter / X links
     is_twitter = ('twitter.com' in url or 'x.com' in url)
@@ -686,8 +775,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             tw_data = await asyncio.to_thread(fetch_twitter_details, url)
             if tw_data == "ERROR_REGION_BLOCKED":
-                await reply_msg.edit_text(f"❌ This specific video is blocked due to local regulations (regional restriction on Twitter). ({VERSION})")
-                return
+                add_failed_download(user_id, url, text, "Region blocked on Twitter")
+                await reply_msg.edit_text(f"❌ This specific video is blocked due to local regulations (regional restriction on Twitter). ({VERSION})\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                return False
             if tw_data and tw_data.get('items'):
                 items = tw_data['items']
                 if media_indices:
@@ -716,15 +806,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     keyboard = InlineKeyboardMarkup([
                         [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
                     ])
-                    await update.message.reply_photo(
+                    await message.reply_photo(
                         photo=item['url'],
                         caption=caption,
                         parse_mode='HTML',
-                        reply_markup=keyboard
+                        reply_markup=keyboard,
+                        read_timeout=300,
+                        write_timeout=300
                     )
-                    track_stat(update.message.from_user.id, "downloads", url=url)
+                    track_stat(user_id, "downloads", url=url)
+                    remove_failed_download(user_id, url)
                     await reply_msg.delete()
-                    return
+                    return True
 
                 # Single video via URL passthrough
                 elif len(items) == 1 and items[0]['type'] in ('video', 'gif'):
@@ -734,20 +827,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     keyboard = InlineKeyboardMarkup([
                         [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
                     ])
-                    v_kwargs = {'supports_streaming': True}
+                    v_kwargs = {'supports_streaming': True, 'read_timeout': 300, 'write_timeout': 300}
                     if item.get('width'): v_kwargs['width'] = item['width']
                     if item.get('height'): v_kwargs['height'] = item['height']
                     try:
-                        await update.message.reply_video(
+                        await message.reply_video(
                             video=item['url'],
                             caption=caption,
                             parse_mode='HTML',
                             reply_markup=keyboard,
                             **v_kwargs
                         )
-                        track_stat(update.message.from_user.id, "downloads", url=url)
+                        track_stat(user_id, "downloads", url=url)
+                        remove_failed_download(user_id, url)
                         await reply_msg.delete()
-                        return
+                        return True
                     except Exception as e:
                         logger.warning(f"Direct video URL send failed (likely >20MB limit): {e}, falling back to yt-dlp")
 
@@ -763,18 +857,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 media_group.append(InputMediaPhoto(media=m['url']))
 
                         for chunk in chunk_list(media_group, 10):
-                            await update.message.reply_media_group(media=chunk)
+                            await message.reply_media_group(media=chunk, read_timeout=300, write_timeout=300)
 
                         buttons = []
                         for idx, m in enumerate(items):
                             buttons.append(InlineKeyboardButton(f"📥 Photo {idx+1} Full-Res", url=m['full_res']))
                         btn_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
                         ctrl_caption = f"📸 <b>Album ({len(items)} photos)</b> • Tap below for uncompressed files:"
-                        await update.message.reply_text(ctrl_caption, reply_markup=InlineKeyboardMarkup(btn_rows), parse_mode='HTML')
+                        await message.reply_text(ctrl_caption, reply_markup=InlineKeyboardMarkup(btn_rows), parse_mode='HTML')
 
-                        track_stat(update.message.from_user.id, "downloads", url=url)
+                        track_stat(user_id, "downloads", url=url)
+                        remove_failed_download(user_id, url)
                         await reply_msg.delete()
-                        return
+                        return True
                     except Exception as e:
                         logger.warning(f"Direct album send failed: {e}, falling back to yt-dlp")
         except Exception as e:
@@ -783,8 +878,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         files, title, original_url = await download_media(url, media_indices)
         if not files:
-            await reply_msg.edit_text("❌ Couldn't find any media to download.")
-            return
+            add_failed_download(user_id, url, text, "No media found")
+            await reply_msg.edit_text(f"❌ Couldn't find any media to download. ({VERSION})\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+            return False
 
         # Build caption
         caption_parts = []
@@ -803,72 +899,131 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         cloud_link = upload_to_gofile(f)
                         if cloud_link:
                             await reply_msg.delete()
-                            await update.message.reply_text(f"{caption}\n\n✅ File was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, parse_mode='HTML')
+                            await message.reply_text(f"{caption}\n\n✅ File was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, parse_mode='HTML')
+                            track_stat(user_id, "downloads", url=original_url)
+                            remove_failed_download(user_id, url)
+                            remove_failed_download(user_id, original_url)
+                            return True
                         else:
-                            await reply_msg.edit_text("❌ File is larger than Telegram's 50MB limit and cloud upload failed.")
-                        if os.path.exists(f): os.remove(f)
-                        return
+                            add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
+                            await reply_msg.edit_text(f"❌ File is larger than Telegram's 50MB limit and cloud upload failed.\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                            return False
                             
                     with open(f, 'rb') as doc:
                         if as_files:
-                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
+                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
                         elif f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
                             w, h = get_video_dimensions(f)
-                            await update.message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, read_timeout=300, write_timeout=300)
+                            await message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, read_timeout=300, write_timeout=300)
                         elif f.endswith(('.jpg', '.png', '.jpeg')):
-                            await update.message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
+                            await message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
                         else:
-                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
+                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
             except Exception as e:
                 logger.error(f"Failed to send file: {e}")
                 if ("timed out" in str(e).lower() or "timeout" in str(e).lower()) and not as_files:
                     try:
                         logger.info("Upload timed out, retrying send as document...")
                         with open(f, 'rb') as doc:
-                            await update.message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
-                        track_stat(update.message.from_user.id, "downloads", url=original_url)
+                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
+                        track_stat(user_id, "downloads", url=original_url)
+                        remove_failed_download(user_id, url)
+                        remove_failed_download(user_id, original_url)
                         await reply_msg.edit_text(f"✅ Done! ({VERSION})")
-                        return
+                        return True
                     except Exception as retry_e:
                         logger.error(f"Retry as document failed: {retry_e}")
-                await reply_msg.edit_text(f"❌ Failed to send file to Telegram: {e}")
-                return
+                add_failed_download(user_id, url, text, f"Failed to send: {e}")
+                await reply_msg.edit_text(f"❌ Failed to send file to Telegram: {e}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                return False
             finally:
                 if os.path.exists(f):
                     os.remove(f)
-            track_stat(update.message.from_user.id, "downloads", url=original_url)
+            track_stat(user_id, "downloads", url=original_url)
+            remove_failed_download(user_id, url)
+            remove_failed_download(user_id, original_url)
             await reply_msg.edit_text(f"✅ Done! ({VERSION})")
+            return True
         else:
             try:
-                await send_album(update.message, files, as_files, caption)
-                track_stat(update.message.from_user.id, "downloads", url=original_url)
+                await send_album(message, files, as_files, caption)
+                track_stat(user_id, "downloads", url=original_url)
+                remove_failed_download(user_id, url)
+                remove_failed_download(user_id, original_url)
                 await reply_msg.edit_text(f"✅ Done! ({VERSION})")
+                return True
             except Exception as e:
                 logger.error(f"Failed to send album: {e}")
-                await reply_msg.edit_text(f"❌ Failed to send album.")
+                add_failed_download(user_id, url, text, f"Failed to send album: {e}")
+                await reply_msg.edit_text(f"❌ Failed to send album.\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                return False
             finally:
                 for f in files:
                     if os.path.exists(f):
                         os.remove(f)
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download failed: {e}")
-        if hasattr(e, 'message'):
-            error_msg = e.message
-        else:
-            error_msg = str(e)
-        
-        # Truncate extremely long error messages
+        error_msg = e.message if hasattr(e, 'message') else str(e)
         if len(error_msg) > 800:
             error_msg = error_msg[:800] + "... [Truncated]"
-            
-        await reply_msg.edit_text(f"❌ Could not download from this link. ({VERSION})\n\n<b>Debug Report:</b>\n<pre>{error_msg}</pre>", parse_mode='HTML')
-        return
+        add_failed_download(user_id, url, text, f"Download failed: {error_msg[:120]}")
+        await reply_msg.edit_text(f"❌ Could not download from this link. ({VERSION})\n\n<b>Debug Report:</b>\n<pre>{error_msg}</pre>\n\n<i>Added to your /retry queue. Type /retry to try again later.</i>", parse_mode='HTML')
+        return False
     except Exception as e:
         import traceback
         logger.error(f"Error processing link: {e}\n{traceback.format_exc()}")
         tb = traceback.format_exc().replace('<', '&lt;').replace('>', '&gt;')
         if len(tb) > 3500: tb = "... (truncated)\n" + tb[-3500:]
-        await reply_msg.edit_text(f"❌ Error processing link. ({VERSION})\n\n<b>Debug Report:</b>\n<pre>{tb}</pre>", parse_mode='HTML')
+        add_failed_download(user_id, url, text, f"Error: {e}")
+        await reply_msg.edit_text(f"❌ Error processing link. ({VERSION})\n\n<b>Debug Report:</b>\n<pre>{tb}</pre>\n\n<i>Added to your /retry queue. Type /retry to try again later.</i>", parse_mode='HTML')
+        return False
+
+async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    args = context.args
+    if args and args[0].lower() in ['clear', 'reset']:
+        clear_failed_queue(user_id)
+        await update.message.reply_text("🧹 Cleared your failed retry list.")
+        return
+    
+    if args and args[0].lower() in ['list', 'show']:
+        items = get_failed_queue(user_id)
+        if not items:
+            await update.message.reply_text("✨ You have no failed downloads queued.")
+            return
+        lines = [f"📋 <b>Failed Downloads ({len(items)}):</b>\n"]
+        for idx, item in enumerate(items, 1):
+            url_display = item.get('url', '')
+            reason = item.get('reason', 'Failed')
+            time_str = item.get('time', '')
+            lines.append(f"{idx}. 🔗 {url_display}\n   ⚠️ <i>{reason}</i> ({time_str})")
+        lines.append("\n<i>Send /retry to attempt downloading these again, or /retry clear to reset.</i>")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    items = get_failed_queue(user_id)
+    if not items:
+        await update.message.reply_text("✨ You have no failed downloads to retry!")
+        return
+
+    status_msg = await update.message.reply_text(f"🔄 Retrying {len(items)} failed download(s)...")
+    succeeded = 0
+    failed = 0
+    for item in list(items):
+        raw_text = item.get('raw_text') or item.get('url')
+        success = await process_media_request(update.message, raw_text, user_id)
+        if success:
+            succeeded += 1
+            remove_failed_download(user_id, item.get('url'))
+        else:
+            failed += 1
+        await asyncio.sleep(1)
+    
+    remaining = get_failed_queue(user_id)
+    summary = f"🏁 <b>Retry Complete:</b>\n✅ Succeeded: {succeeded}\n❌ Still failing: {failed}"
+    if remaining:
+        summary += f"\n\n<i>Use /retry list to view remaining failures, or /retry clear to discard them.</i>"
+    await status_msg.edit_text(summary, parse_mode="HTML")
 
 async def adminmisuse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -1736,6 +1891,7 @@ async def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("manga", manga_command))
     application.add_handler(CommandHandler("ln", ln_command))
+    application.add_handler(CommandHandler("retry", retry_command))
     application.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))

@@ -2,3 +2,6 @@
 downloads/
 __pycache__/
 *.pyc
+bot.log
+retry_queue.json
+wishlist.json
