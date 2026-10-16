@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.2.1"
+VERSION = "v2.3.0"
 
 # Enable logging
 logging.basicConfig(
@@ -39,9 +39,11 @@ if MONGO_URI:
     wishlist_col = db['wishlist']
     stats_col = db['stats']
     retry_col = db['retry_queue']
+    history_col = db['download_history']
 else:
     mongo_client = None
     retry_col = None
+    history_col = None
 
 def track_stat(user_id, field="downloads", url=None):
     if not mongo_client: return
@@ -196,6 +198,98 @@ def clear_failed_queue(user_id):
                     json.dump(data, f, indent=2)
     except Exception as e:
         logger.error(f"Error clearing retry queue: {e}")
+
+def normalize_history_url(url):
+    if not url:
+        return ""
+    # Strip whitespace, queries, fragments, and trailing slashes for resilient lookup
+    clean = url.strip().split('?')[0].split('#')[0].rstrip('/')
+    return clean.lower()
+
+def record_download_history(user_id, url, status, title=None, error=None, message_id=None):
+    from datetime import datetime, timezone
+    try:
+        norm_key = normalize_history_url(url)
+        record = {
+            "user_id": str(user_id),
+            "url": url,
+            "norm_key": norm_key,
+            "status": status,
+            "title": title,
+            "error": str(error) if error else None,
+            "message_id": message_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "time_display": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+        if mongo_client and history_col is not None:
+            history_col.update_one(
+                {"user_id": str(user_id), "norm_key": norm_key},
+                {"$set": record},
+                upsert=True
+            )
+        else:
+            history = {}
+            if os.path.exists('download_history.json'):
+                try:
+                    with open('download_history.json', 'r', encoding='utf-8') as f:
+                        history = json.load(f)
+                except Exception:
+                    history = {}
+            user_hist = history.get(str(user_id), {})
+            user_hist[norm_key] = record
+            if len(user_hist) > 300:
+                sorted_keys = sorted(user_hist.keys(), key=lambda k: user_hist[k].get('timestamp', ''), reverse=True)[:300]
+                user_hist = {k: user_hist[k] for k in sorted_keys}
+            history[str(user_id)] = user_hist
+            with open('download_history.json', 'w', encoding='utf-8') as f:
+                json.dump(history, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error recording download history: {e}")
+
+def get_download_history_item(user_id, url):
+    try:
+        norm_key = normalize_history_url(url)
+        if mongo_client and history_col is not None:
+            doc = history_col.find_one({
+                "user_id": str(user_id),
+                "$or": [{"norm_key": norm_key}, {"url": url}]
+            })
+            return doc
+        else:
+            if os.path.exists('download_history.json'):
+                with open('download_history.json', 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                    user_hist = history.get(str(user_id), {})
+                    if norm_key in user_hist:
+                        return user_hist[norm_key]
+                    for k, item in user_hist.items():
+                        if k == norm_key or item.get('url') == url:
+                            return item
+    except Exception as e:
+        logger.error(f"Error getting download history: {e}")
+    return None
+
+def extract_urls_from_message(msg):
+    if not msg:
+        return []
+    urls = []
+    text = msg.text or msg.caption or ""
+    entities = list(msg.entities or ()) + list(msg.caption_entities or ())
+    for entity in entities:
+        if entity.type == 'text_link' and entity.url:
+            if entity.url not in urls:
+                urls.append(entity.url)
+        elif entity.type == 'url':
+            u = text[entity.offset:entity.offset + entity.length]
+            if u and u not in urls:
+                urls.append(u)
+    for u in re.findall(r'https?://[^\s<>"]+', text):
+        clean_u = u.rstrip(').,;!?')
+        if clean_u not in urls:
+            urls.append(clean_u)
+    return urls
+
+redl_cache = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -675,15 +769,18 @@ async def send_album(message, files, as_files, caption=None):
             h.close()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or update.message.caption
-    if not text:
+    message = update.message
+    if not message:
         return
+    text = message.text or message.caption or ""
+    user_id = message.from_user.id
+    reply_to = message.reply_to_message
 
     # Check for nhentai 5-6 digit code
     nh_match = re.fullmatch(r'(\d{5,6})', text.strip())
     if nh_match:
         code = nh_match.group(1)
-        reply_msg = await update.message.reply_text("⏳ Fetching doujin info...")
+        reply_msg = await update.message.reply_text("⏳ Fetching doujin info...", quote=True)
         try:
             from curl_cffi import requests as c_requests
             from bs4 import BeautifulSoup
@@ -699,9 +796,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tags = [a.find('span', class_='name').text for a in soup.find_all('a', class_='tag') if a.find('span', class_='name')]
                     
                     # Save to wishlist database
-                    user_id = update.message.from_user.id
                     wishlist = get_wishlist(user_id)
-                    # Remove if already exists to move to top
                     wishlist = [item for item in wishlist if item.get('code') != code]
                     wishlist.insert(0, {
                         'code': code,
@@ -709,7 +804,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         'cover_url': cover_url,
                         'tags': tags
                     })
-                    # Keep only last 100 to avoid KV limit
                     if len(wishlist) > 100: wishlist = wishlist[:100]
                     save_wishlist(user_id, wishlist)
                     
@@ -728,7 +822,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ])
                         
                         with open(cover_path, 'rb') as f:
-                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard)
+                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard, quote=True)
                             
                         os.remove(cover_path)
                         await reply_msg.delete()
@@ -740,7 +834,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_msg.edit_text(f"❌ Error fetching doujin info. ({VERSION})")
         return
 
-    return await process_media_request(update.message, text, update.message.from_user.id)
+    # Check if current message has its own links
+    new_urls = re.findall(r'(https?://\S+)', text)
+
+    # If the user did NOT send a new link, BUT replied to an existing message:
+    if not new_urls and reply_to:
+        reply_urls = extract_urls_from_message(reply_to)
+        if reply_urls:
+            target_url = reply_urls[0]
+            await handle_replied_link(message, reply_to, target_url, text, user_id)
+            return
+
+    return await process_media_request(message, text, user_id)
 
 async def process_media_request(message, text: str, user_id: int) -> bool:
     urls = re.findall(r'(https?://\S+)', text)
@@ -776,6 +881,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
             tw_data = await asyncio.to_thread(fetch_twitter_details, url)
             if tw_data == "ERROR_REGION_BLOCKED":
                 add_failed_download(user_id, url, text, "Region blocked on Twitter")
+                record_download_history(user_id, url=url, status="failed", error="Region blocked on Twitter", message_id=message.message_id)
                 await reply_msg.edit_text(f"❌ This specific video is blocked due to local regulations (regional restriction on Twitter). ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
                 return False
             if tw_data and tw_data.get('items'):
@@ -818,6 +924,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
                     )
                     track_stat(user_id, "downloads", url=url)
                     remove_failed_download(user_id, url)
+                    record_download_history(user_id, url=url, status="success", title=title, message_id=message.message_id)
                     try:
                         await reply_msg.delete()
                     except:
@@ -845,6 +952,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
                         )
                         track_stat(user_id, "downloads", url=url)
                         remove_failed_download(user_id, url)
+                        record_download_history(user_id, url=url, status="success", title=title, message_id=message.message_id)
                         try:
                             await reply_msg.delete()
                         except:
@@ -876,6 +984,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
 
                         track_stat(user_id, "downloads", url=url)
                         remove_failed_download(user_id, url)
+                        record_download_history(user_id, url=url, status="success", title=title, message_id=message.message_id)
                         try:
                             await reply_msg.delete()
                         except:
@@ -890,6 +999,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
         files, title, original_url = await download_media(url, media_indices)
         if not files:
             add_failed_download(user_id, url, text, "No media found")
+            record_download_history(user_id, url=url, status="failed", error="No media found", message_id=message.message_id)
             await reply_msg.edit_text(f"❌ Couldn't find any media to download. ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
             return False
 
@@ -921,9 +1031,11 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
                             track_stat(user_id, "downloads", url=original_url)
                             remove_failed_download(user_id, url)
                             remove_failed_download(user_id, original_url)
+                            record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
                             return True
                         else:
                             add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
+                            record_download_history(user_id, url=url, status="failed", error="File >50MB and cloud upload failed", message_id=message.message_id)
                             await reply_msg.edit_text(f"❌ File is larger than Telegram's 50MB limit and cloud upload failed.\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
                             return False
                             
@@ -947,6 +1059,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
                         track_stat(user_id, "downloads", url=original_url)
                         remove_failed_download(user_id, url)
                         remove_failed_download(user_id, original_url)
+                        record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
                         try:
                             await reply_msg.delete()
                         except:
@@ -955,6 +1068,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
                     except Exception as retry_e:
                         logger.error(f"Retry as document failed: {retry_e}")
                 add_failed_download(user_id, url, text, f"Failed to send: {e}")
+                record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
                 await reply_msg.edit_text(f"❌ Failed to send file to Telegram: {html.escape(str(e))}\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
                 return False
             finally:
@@ -963,6 +1077,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
             track_stat(user_id, "downloads", url=original_url)
             remove_failed_download(user_id, url)
             remove_failed_download(user_id, original_url)
+            record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
             try:
                 await reply_msg.delete()
             except:
@@ -974,6 +1089,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
                 track_stat(user_id, "downloads", url=original_url)
                 remove_failed_download(user_id, url)
                 remove_failed_download(user_id, original_url)
+                record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
                 try:
                     await reply_msg.delete()
                 except:
@@ -982,6 +1098,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
             except Exception as e:
                 logger.error(f"Failed to send album: {e}")
                 add_failed_download(user_id, url, text, f"Failed to send album: {e}")
+                record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
                 await reply_msg.edit_text(f"❌ Failed to send album.\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
                 return False
             finally:
@@ -994,6 +1111,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
         if len(error_msg) > 800:
             error_msg = error_msg[:800] + "... [Truncated]"
         add_failed_download(user_id, url, text, f"Download failed: {error_msg[:120]}")
+        record_download_history(user_id, url=url, status="failed", error=str(error_msg)[:120], message_id=message.message_id)
         escaped_err = html.escape(error_msg)
         await reply_msg.edit_text(f"❌ Could not download from this link. ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<b>Debug Report:</b>\n<pre>{escaped_err}</pre>\n\n<i>Added to your /retry queue. Type /retry to try again later.</i>", parse_mode='HTML')
         return False
@@ -1004,11 +1122,136 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
         if len(tb) > 3000: tb = "... (truncated)\n" + tb[-3000:]
         escaped_tb = html.escape(tb)
         add_failed_download(user_id, url, text, f"Error: {e}")
+        record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
         await reply_msg.edit_text(f"❌ Error processing link. ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<b>Debug Report:</b>\n<pre>{escaped_tb}</pre>\n\n<i>Added to your /retry queue. Type /retry to try again later.</i>", parse_mode='HTML')
         return False
 
+async def handle_replied_link(message, reply_to, url: str, user_text: str, user_id: int):
+    """Inspects a link the user replied to, checks past success/failure, and takes action."""
+    # 1. Check if user explicitly wants to force download (typed "retry", "download", "-f", etc.)
+    is_force_download = bool(re.search(r'\b(retry|redownload|download|dl|again|-f)\b', user_text.lower()))
+    
+    # 2. Check retry queue
+    failed_items = get_failed_queue(user_id)
+    clean_url = url.split('?')[0]
+    failed_match = next((item for item in failed_items if item.get('url') == url or item.get('url', '').split('?')[0] == clean_url), None)
+    
+    # 3. Check download history
+    history_item = get_download_history_item(user_id, url)
+    
+    # 4. Check reply_to message itself
+    is_reply_to_bot = bool(reply_to.from_user and reply_to.from_user.is_bot)
+    reply_to_text = (reply_to.text or reply_to.caption or "").lower()
+    
+    is_bot_error = is_reply_to_bot and any(k in reply_to_text for k in ['timed out', 'could not download', 'failed to send', '❌', 'error'])
+    is_bot_success = is_reply_to_bot and (bool(reply_to.video or reply_to.photo or reply_to.document) or 'gofile.io' in reply_to_text or '✅' in reply_to_text)
+    
+    has_succeeded = False
+    success_title = None
+    success_time = None
+    
+    if history_item and history_item.get('status') == 'success':
+        has_succeeded = True
+        success_title = history_item.get('title')
+        success_time = history_item.get('time_display')
+    elif is_bot_success:
+        has_succeeded = True
+        success_title = (reply_to.caption or "").split('\n')[0] if reply_to.caption else None
+        
+    has_failed = False
+    failure_reason = None
+    if failed_match:
+        has_failed = True
+        failure_reason = failed_match.get('reason')
+    elif is_bot_error:
+        has_failed = True
+        failure_reason = reply_to.text.split('\n')[0] if reply_to.text else "Bot reported an error"
+    elif history_item and history_item.get('status') == 'failed':
+        has_failed = True
+        failure_reason = history_item.get('error')
+
+    # If it succeeded and the user did NOT explicitly request a re-download:
+    if has_succeeded and not is_force_download:
+        token = uuid.uuid4().hex[:10]
+        if len(redl_cache) > 200:
+            redl_cache.pop(next(iter(redl_cache)))
+        redl_cache[token] = {"url": url, "user_id": user_id}
+        
+        title_display = html.escape(success_title[:250]) if success_title else "Media item"
+        escaped_url = html.escape(url, quote=True)
+        disp_url = html.escape(url if len(url) <= 65 else url[:62] + "...")
+        time_display = f" ({html.escape(success_time)})" if success_time else ""
+        
+        reply_card = (
+            f"✅ <b>This link was already completed!</b>\n\n"
+            f"📌 <b>Title:</b> {title_display}\n"
+            f"🔗 <b>Link:</b> <a href=\"{escaped_url}\">{disp_url}</a>\n"
+            f"🕒 <b>Delivered:</b> Successfully completed{time_display}.\n\n"
+            f"<i>Tap below if you want to re-download or get it as an uncompressed file:</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Download Again", callback_data=f"redl_std_{token}")],
+            [InlineKeyboardButton("📥 Download as File (-f)", callback_data=f"redl_doc_{token}")]
+        ])
+        await message.reply_text(reply_card, reply_markup=keyboard, parse_mode="HTML", quote=True)
+        return
+
+    # Otherwise: It failed, or was not completed, or user requested re-download.
+    # Take it from there!
+    if has_failed:
+        status_note = f"⚠️ <b>Previous attempt failed:</b> <i>{html.escape(str(failure_reason)[:200])}</i>\n\n"
+    elif is_force_download:
+        status_note = "🔄 <b>Re-download requested!</b>\n\n"
+    else:
+        status_note = "🔍 <b>No record of successful delivery found.</b>\n\n"
+        
+    status_msg = await message.reply_text(
+        f"{status_note}🚀 <b>Taking it from here... Downloading now!</b>",
+        parse_mode="HTML",
+        quote=True
+    )
+    
+    clean_user_opts = user_text.replace(url, '').strip()
+    req_text = f"{url} {clean_user_opts}".strip()
+    success = await process_media_request(message, req_text, user_id)
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+async def redl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Fetching media...")
+    data = query.data
+    parts = data.split('_', 2)
+    mode = parts[1] if len(parts) > 1 else 'std'
+    token = parts[2] if len(parts) > 2 else ''
+    
+    url_info = redl_cache.get(token)
+    if not url_info:
+        await query.message.reply_text("⚠️ This download session expired. Please reply to the link again.", quote=True)
+        return
+        
+    url = url_info.get('url')
+    as_files = (mode == 'doc')
+    req_text = f"{url} -f" if as_files else url
+    user_id = query.from_user.id
+    
+    await process_media_request(query.message, req_text, user_id)
+
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
+    message = update.message
+    reply_to = message.reply_to_message
+
+    # If replying to a message with a link while calling /retry, retry that specific link!
+    if reply_to:
+        reply_urls = extract_urls_from_message(reply_to)
+        if reply_urls:
+            target_url = reply_urls[0]
+            await handle_replied_link(message, reply_to, target_url, "retry", user_id)
+            return
+
     args = context.args
     if args and args[0].lower() in ['clear', 'reset']:
         clear_failed_queue(user_id)
@@ -1929,6 +2172,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(wh_callback, pattern="^nh_"))
     application.add_handler(CallbackQueryHandler(manga_callback, pattern="^mg_"))
     application.add_handler(CallbackQueryHandler(ln_callback, pattern="^ln_"))
+    application.add_handler(CallbackQueryHandler(redl_callback, pattern="^redl_"))
 
     # Cleanup orphan files every 10 minutes
     application.job_queue.run_repeating(cleanup_job, interval=600, first=600)
