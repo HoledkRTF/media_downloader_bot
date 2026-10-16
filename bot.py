@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.3.0"
+VERSION = "v2.4.0"
 
 # Enable logging
 logging.basicConfig(
@@ -302,7 +302,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• For albums, add numbers to pick specific items: "
         "<code>https://reddit.com/... 1 3 5</code>\n"
         "• Use ranges too: <code>https://reddit.com/... 2-6</code>\n"
-        "• /retry — Retry any previously failed downloads (/retry list, /retry clear)\n\n"
+        "• /retry — Retry any previously failed downloads (/retry list, /retry clear)\n"
+        "• /clean — Clean up all bot responses & media while keeping your link messages intact\n\n"
 
         "📖 <b>Manga & Doujins</b>\n"
         "/manga <code>&lt;title&gt;</code> — Search & download manga chapters as CBZ\n"
@@ -852,7 +853,30 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
     if not urls:
         return False
 
-    url = urls[0]
+    if len(urls) > 1:
+        as_files = bool(re.search(r'\s-f\b', text))
+        flag_suffix = " -f" if as_files else ""
+        status_msg = await message.reply_text(f"📋 Found {len(urls)} links! Processing them one by one...", quote=True)
+        succeeded = 0
+        failed = 0
+        for idx, single_url in enumerate(urls, 1):
+            single_text = f"{single_url}{flag_suffix}"
+            success = await process_single_link(message, single_url, single_text, user_id)
+            if success:
+                succeeded += 1
+            else:
+                failed += 1
+            await asyncio.sleep(1)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        return succeeded > 0
+
+    return await process_single_link(message, urls[0], text, user_id)
+
+async def process_single_link(message, url: str, text: str, user_id: int) -> bool:
     as_files = bool(re.search(r'\s-f\b', text))
 
     clean_text = text.replace(url, '').replace('-f', '').strip()
@@ -1203,7 +1227,7 @@ async def handle_replied_link(message, reply_to, url: str, user_text: str, user_
     elif is_force_download:
         status_note = "🔄 <b>Re-download requested!</b>\n\n"
     else:
-        status_note = "🔍 <b>No record of successful delivery found.</b>\n\n"
+        status_note = "ℹ️ <b>Link predates recent history:</b>\n<i>Fetching media now to ensure it is delivered and logged in your history...</i>\n\n"
         
     status_msg = await message.reply_text(
         f"{status_note}🚀 <b>Taking it from here... Downloading now!</b>",
@@ -1296,6 +1320,35 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if remaining:
         summary += f"\n\n<i>Use /retry list to view remaining failures, or /retry clear to discard them.</i>"
     await status_msg.edit_text(summary, parse_mode="HTML")
+
+async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes all messages sent by the bot in the chat while keeping user's link messages intact."""
+    message = update.message
+    if not message:
+        return
+    user_id = message.from_user.id
+    current_msg_id = message.message_id
+    bot = context.bot
+
+    status_msg = await message.reply_text("🧹 Cleaning up bot messages... Your links will remain untouched.", quote=True)
+
+    deleted_count = 0
+    # Sweep backwards through up to 300 recent message IDs
+    for msg_id in range(current_msg_id - 1, max(0, current_msg_id - 300), -1):
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            deleted_count += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+
+    await status_msg.edit_text(f"✅ Cleaned up {deleted_count} bot responses! Your original links are preserved.")
+    await asyncio.sleep(4)
+    try:
+        await status_msg.delete()
+        await message.delete()
+    except Exception:
+        pass
 
 async def adminmisuse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -2164,6 +2217,7 @@ async def main():
     application.add_handler(CommandHandler("manga", manga_command))
     application.add_handler(CommandHandler("ln", ln_command))
     application.add_handler(CommandHandler("retry", retry_command))
+    application.add_handler(CommandHandler(["clean", "cleanup", "purge"], clean_command))
     application.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
