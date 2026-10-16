@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.4.0"
+VERSION = "v2.5.0"
 
 # Enable logging
 logging.basicConfig(
@@ -374,7 +374,7 @@ def fetch_twitter_details(url):
         logger.error(f"vxtwitter API error in fetch_twitter_details: {e}")
     return None
 
-async def download_media(url: str, media_indices: list = None):
+async def download_media(url: str, media_indices: list = None, as_files: bool = False):
     """Returns (files, title, original_url)"""
     title = None
     original_url = url
@@ -455,7 +455,23 @@ async def download_media(url: str, media_indices: list = None):
         except Exception as e:
             logger.error(f"vxreddit fallback failed: {e}")
 
-        # 2. Fallback to direct Reddit JSON API as secondary backup
+        # 2. Check Rapidsave resolver for external embedded videos (RedGifs, Imgur, etc.) to bypass Reddit age-gate
+        try:
+            r_rs = s.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, allow_redirects=True, timeout=8)
+            resolved_url = r_rs.url.split('?')[0]
+            rs_res = s.get(f'https://rapidsave.com/info?url={resolved_url}', headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}, timeout=10)
+            if rs_res.status_code == 200:
+                rs_soup = BeautifulSoup(rs_res.text, 'html.parser')
+                d_btn = rs_soup.find('a', class_='downloadbutton')
+                if d_btn and d_btn.get('href'):
+                    target_media = d_btn.get('href')
+                    if any(d in target_media for d in ['redgifs.com', 'imgur.com', 'gfycat.com']):
+                        logger.info(f"Resolved Reddit external embed via Rapidsave: {target_media}")
+                        return [], target_media
+        except Exception as e:
+            logger.warning(f"Rapidsave external embed check failed: {e}")
+
+        # 3. Fallback to direct Reddit JSON API as tertiary backup
         try:
             s = requests.Session()
             s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
@@ -641,9 +657,16 @@ async def download_media(url: str, media_indices: list = None):
                 logger.error(f"TikTok tikwm fallback failed: {e}")
                 # Fall through to yt-dlp if it fails
 
+        # Bandwidth optimization: Default to <=720p to save ~70% bandwidth unless raw files (-f) explicitly requested
+        format_selector = (
+            'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best/bv*+ba/b'
+            if as_files else
+            'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+        )
+
         ydl_opts = {
             'outtmpl': 'downloads/%(extractor)s_%(id)s.%(ext)s',
-            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best/bv*+ba/b',
+            'format': format_selector,
             'merge_output_format': 'mp4',
             'postprocessor_args': {'merger': ['-c', 'copy']},
             'noplaylist': False,
@@ -660,6 +683,16 @@ async def download_media(url: str, media_indices: list = None):
             with open('ig_cookies.txt', 'w') as f:
                 f.write(f"# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n")
             ydl_opts['cookiefile'] = 'ig_cookies.txt'
+
+        # Add Reddit cookie if provided in .env or file to bypass strict 18+ login walls
+        reddit_cookie = os.environ.get('REDDIT_SESSION')
+        if ('reddit.com' in url or 'redd.it' in url):
+            if reddit_cookie:
+                with open('reddit_cookies.txt', 'w', encoding='utf-8') as f:
+                    f.write(f"# Netscape HTTP Cookie File\n.reddit.com\tTRUE\t/\tTRUE\t2145916800\treddit_session\t{reddit_cookie}\n")
+                ydl_opts['cookiefile'] = 'reddit_cookies.txt'
+            elif os.path.exists('reddit_cookies.txt'):
+                ydl_opts['cookiefile'] = 'reddit_cookies.txt'
             
         os.makedirs('downloads', exist_ok=True)
         files = []
@@ -1020,7 +1053,7 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
             logger.warning(f"Zero-bandwidth Twitter extraction failed: {e}, falling back to standard downloader")
 
     try:
-        files, title, original_url = await download_media(url, media_indices)
+        files, title, original_url = await download_media(url, media_indices, as_files=as_files)
         if not files:
             add_failed_download(user_id, url, text, "No media found")
             record_download_history(user_id, url=url, status="failed", error="No media found", message_id=message.message_id)
