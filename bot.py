@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.5.0"
+VERSION = "v2.6.0"
 
 # Enable logging
 logging.basicConfig(
@@ -939,7 +939,10 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
             if tw_data == "ERROR_REGION_BLOCKED":
                 add_failed_download(user_id, url, text, "Region blocked on Twitter")
                 record_download_history(user_id, url=url, status="failed", error="Region blocked on Twitter", message_id=message.message_id)
-                await reply_msg.edit_text(f"❌ This specific video is blocked due to local regulations (regional restriction on Twitter). ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                try:
+                    await reply_msg.delete()
+                except Exception:
+                    pass
                 return False
             if tw_data and tw_data.get('items'):
                 items = tw_data['items']
@@ -1057,7 +1060,10 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
         if not files:
             add_failed_download(user_id, url, text, "No media found")
             record_download_history(user_id, url=url, status="failed", error="No media found", message_id=message.message_id)
-            await reply_msg.edit_text(f"❌ Couldn't find any media to download. ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+            try:
+                await reply_msg.delete()
+            except Exception:
+                pass
             return False
 
         # Build caption
@@ -1093,7 +1099,10 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                         else:
                             add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
                             record_download_history(user_id, url=url, status="failed", error="File >50MB and cloud upload failed", message_id=message.message_id)
-                            await reply_msg.edit_text(f"❌ File is larger than Telegram's 50MB limit and cloud upload failed.\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                            try:
+                                await reply_msg.delete()
+                            except Exception:
+                                pass
                             return False
                             
                     with open(f, 'rb') as doc:
@@ -1126,7 +1135,10 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                         logger.error(f"Retry as document failed: {retry_e}")
                 add_failed_download(user_id, url, text, f"Failed to send: {e}")
                 record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
-                await reply_msg.edit_text(f"❌ Failed to send file to Telegram: {html.escape(str(e))}\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                try:
+                    await reply_msg.delete()
+                except Exception:
+                    pass
                 return False
             finally:
                 if os.path.exists(f):
@@ -1156,7 +1168,10 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                 logger.error(f"Failed to send album: {e}")
                 add_failed_download(user_id, url, text, f"Failed to send album: {e}")
                 record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
-                await reply_msg.edit_text(f"❌ Failed to send album.\n🔗 <b>Link:</b> {html.escape(url)}\n\n<i>Added to your /retry queue.</i>", parse_mode='HTML')
+                try:
+                    await reply_msg.delete()
+                except Exception:
+                    pass
                 return False
             finally:
                 for f in files:
@@ -1169,18 +1184,20 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
             error_msg = error_msg[:800] + "... [Truncated]"
         add_failed_download(user_id, url, text, f"Download failed: {error_msg[:120]}")
         record_download_history(user_id, url=url, status="failed", error=str(error_msg)[:120], message_id=message.message_id)
-        escaped_err = html.escape(error_msg)
-        await reply_msg.edit_text(f"❌ Could not download from this link. ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<b>Debug Report:</b>\n<pre>{escaped_err}</pre>\n\n<i>Added to your /retry queue. Type /retry to try again later.</i>", parse_mode='HTML')
+        try:
+            await reply_msg.delete()
+        except Exception:
+            pass
         return False
     except Exception as e:
         import traceback
         logger.error(f"Error processing link: {e}\n{traceback.format_exc()}")
-        tb = traceback.format_exc()
-        if len(tb) > 3000: tb = "... (truncated)\n" + tb[-3000:]
-        escaped_tb = html.escape(tb)
         add_failed_download(user_id, url, text, f"Error: {e}")
         record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
-        await reply_msg.edit_text(f"❌ Error processing link. ({VERSION})\n🔗 <b>Link:</b> {html.escape(url)}\n\n<b>Debug Report:</b>\n<pre>{escaped_tb}</pre>\n\n<i>Added to your /retry queue. Type /retry to try again later.</i>", parse_mode='HTML')
+        try:
+            await reply_msg.delete()
+        except Exception:
+            pass
         return False
 
 async def handle_replied_link(message, reply_to, url: str, user_text: str, user_id: int):
