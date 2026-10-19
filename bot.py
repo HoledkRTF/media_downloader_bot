@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.7.1"
+VERSION = "v2.7.2"
 
 # Enable logging
 logging.basicConfig(
@@ -2297,15 +2297,22 @@ async def main():
             try:
                 data = await request.json()
                 update = Update.de_json(data, application.bot)
-                await application.update_queue.put(update)
+                asyncio.create_task(application.process_update(update))
                 return web.Response(text="OK")
             except Exception as e:
                 logger.error(f"Error handling webhook: {e}")
                 return web.Response(status=500)
 
+        async def get_logs(request):
+            if os.path.exists("bot.log"):
+                with open("bot.log", "r", encoding="utf-8", errors="ignore") as f:
+                    return web.Response(text=f.read()[-5000:], content_type="text/plain")
+            return web.Response(text="No logs yet", content_type="text/plain")
+
         # Setup aiohttp web server
         app = web.Application()
         app.router.add_get("/", health_check)
+        app.router.add_get("/logs", get_logs)
         app.router.add_post("/webhook", telegram_webhook)
         
         runner = web.AppRunner(app)
