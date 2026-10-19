@@ -1,5 +1,5 @@
 ## Recent Codenames
-- **Phantom-Relay** (v2.7.0): Asynchronous non-blocking Telegram webhook dispatch via PTB update queue, self-ping keepalive preventing Render idle sleep, and resilient album delivery with allow_sending_without_reply.
+- **Phantom-Relay** (v2.7.1): Asynchronous non-blocking Telegram webhook dispatch via PTB update queue, on-demand spin-down to conserve Render free hours, and resilient album delivery with allow_sending_without_reply.
 - **Silent-Shadow** (v2.6.0): Silent failure handling — when downloads fail, they are automatically queued to the persistent retry list/database and their temporary status messages are deleted from chat instead of displaying ugly error cards.
 - **Vortex-Bypass** (v2.5.0): Added automated Reddit age-gate bypass via embedded video resolver (recovering RedGifs/external media without account requirement), REDDIT_SESSION cookie support for native 18+ Reddit videos, and default 720p format selector saving up to 84% internet bandwidth.
 - **Aegis-Purge** (v2.4.0): Added /clean command to sweep and delete bot responses, media, and error cards while strictly preserving user link messages intact; added sequential multi-link batch processing to download multiple URLs one by one in order.

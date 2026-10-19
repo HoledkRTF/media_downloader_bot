@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.7.0"
+VERSION = "v2.7.1"
 
 # Enable logging
 logging.basicConfig(
@@ -2289,17 +2289,6 @@ async def main():
     if is_render:
         # Set Telegram Webhook to point to Render
         await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
-
-        # Keepalive self-ping on Render to prevent spinning down
-        async def keepalive_job(context: ContextTypes.DEFAULT_TYPE):
-            try:
-                import urllib.request
-                await asyncio.to_thread(urllib.request.urlopen, f"{RENDER_URL}/", timeout=15)
-                logger.debug("Keepalive ping successfully sent to self")
-            except Exception as e:
-                logger.debug(f"Keepalive ping note: {e}")
-
-        application.job_queue.run_repeating(keepalive_job, interval=600, first=300)
 
         async def health_check(request):
             return web.Response(text="Bot is running!")
