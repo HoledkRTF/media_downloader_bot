@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.6.0"
+VERSION = "v2.7.0"
 
 # Enable logging
 logging.basicConfig(
@@ -783,7 +783,7 @@ async def send_album(message, files, as_files, caption=None):
                 handles.append(handle)
                 group.append(InputMediaDocument(handle, caption=caption if i == 0 else None, parse_mode='HTML' if caption else None))
             for chunk in chunk_list(group, 10):
-                await message.reply_media_group(media=chunk, quote=True, read_timeout=300, write_timeout=300)
+                await message.reply_media_group(media=chunk, quote=True, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
         else:
             group = []
             for i, f in enumerate(valid_files):
@@ -797,7 +797,7 @@ async def send_album(message, files, as_files, caption=None):
                 else:
                     group.append(InputMediaPhoto(handle, caption=cap, parse_mode=pm))
             for chunk in chunk_list(group, 10):
-                await message.reply_media_group(media=chunk, quote=True, read_timeout=300, write_timeout=300)
+                await message.reply_media_group(media=chunk, quote=True, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
     finally:
         for h in handles:
             h.close()
@@ -2290,6 +2290,17 @@ async def main():
         # Set Telegram Webhook to point to Render
         await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
 
+        # Keepalive self-ping on Render to prevent spinning down
+        async def keepalive_job(context: ContextTypes.DEFAULT_TYPE):
+            try:
+                import urllib.request
+                await asyncio.to_thread(urllib.request.urlopen, f"{RENDER_URL}/", timeout=15)
+                logger.debug("Keepalive ping successfully sent to self")
+            except Exception as e:
+                logger.debug(f"Keepalive ping note: {e}")
+
+        application.job_queue.run_repeating(keepalive_job, interval=600, first=300)
+
         async def health_check(request):
             return web.Response(text="Bot is running!")
 
@@ -2297,8 +2308,8 @@ async def main():
             try:
                 data = await request.json()
                 update = Update.de_json(data, application.bot)
-                await application.process_update(update)
-                return web.Response()
+                await application.update_queue.put(update)
+                return web.Response(text="OK")
             except Exception as e:
                 logger.error(f"Error handling webhook: {e}")
                 return web.Response(status=500)
