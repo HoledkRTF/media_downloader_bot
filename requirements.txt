@@ -1,11 +1,9 @@
-python-telegram-bot[job-queue]
+python-telegram-bot[job-queue]>=21.4
 yt-dlp
 curl_cffi
 requests
 python-dotenv
 aiohttp
 EbookLib
-bs4
 beautifulsoup4
-cloudscraper
 pymongo

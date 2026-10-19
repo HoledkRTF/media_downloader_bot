@@ -5,3 +5,10 @@ __pycache__/
 bot.log
 retry_queue.json
 wishlist.json
+download_history.json
+test.json
+metadata.json
+*.epub
+*.cbz
+*.session
+test_*.py

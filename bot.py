@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.7.2"
+VERSION = "v2.8.0"
 
 # Enable logging
 logging.basicConfig(
@@ -28,7 +28,26 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-2ia1.onrender.com")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-skg5.onrender.com")
+
+def _ensure_cookies():
+    ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
+    if ig_cookie and not os.path.exists('ig_cookies.txt'):
+        try:
+            with open('ig_cookies.txt', 'w', encoding='utf-8') as f:
+                f.write(f"# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n")
+        except Exception:
+            pass
+
+    reddit_cookie = os.environ.get('REDDIT_SESSION')
+    if reddit_cookie and not os.path.exists('reddit_cookies.txt'):
+        try:
+            with open('reddit_cookies.txt', 'w', encoding='utf-8') as f:
+                f.write(f"# Netscape HTTP Cookie File\n.reddit.com\tTRUE\t/\tTRUE\t2145916800\treddit_session\t{reddit_cookie}\n")
+        except Exception:
+            pass
+
+_ensure_cookies()
 
 import json
 
@@ -268,6 +287,22 @@ def get_download_history_item(user_id, url):
     except Exception as e:
         logger.error(f"Error getting download history: {e}")
     return None
+
+async def _on_download_success(user_id, url=None, original_url=None, title=None, message_id=None, reply_msg=None):
+    target = original_url or url
+    track_stat(user_id, "downloads", url=target)
+    if url:
+        remove_failed_download(user_id, url)
+    if original_url and original_url != url:
+        remove_failed_download(user_id, original_url)
+    if target:
+        record_download_history(user_id, url=target, status="success", title=title, message_id=message_id)
+    if reply_msg:
+        try:
+            await reply_msg.delete()
+        except Exception:
+            pass
+
 
 def extract_urls_from_message(msg):
     if not msg:
@@ -552,11 +587,8 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
             'no_warnings': True,
         }
         
-        # Add Instagram cookie if provided in .env to bypass the strict login wall
-        ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
-        if ig_cookie and ('instagram.com' in url or 'ig.me' in url):
-            with open('ig_cookies.txt', 'w') as f:
-                f.write(f"# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n")
+        # Add Instagram cookie if available to bypass the strict login wall
+        if ('instagram.com' in url or 'ig.me' in url) and os.path.exists('ig_cookies.txt'):
             ydl_opts['cookiefile'] = 'ig_cookies.txt'
 
         try:
@@ -677,22 +709,13 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
         if media_indices:
             ydl_opts['playlist_items'] = ','.join(str(idx) for idx in media_indices)
             
-        # Add Instagram cookie if provided in .env to bypass the strict login wall
-        ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
-        if ig_cookie and ('instagram.com' in url or 'ig.me' in url):
-            with open('ig_cookies.txt', 'w') as f:
-                f.write(f"# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n")
+        # Add Instagram cookie if available
+        if ('instagram.com' in url or 'ig.me' in url) and os.path.exists('ig_cookies.txt'):
             ydl_opts['cookiefile'] = 'ig_cookies.txt'
 
-        # Add Reddit cookie if provided in .env or file to bypass strict 18+ login walls
-        reddit_cookie = os.environ.get('REDDIT_SESSION')
-        if ('reddit.com' in url or 'redd.it' in url):
-            if reddit_cookie:
-                with open('reddit_cookies.txt', 'w', encoding='utf-8') as f:
-                    f.write(f"# Netscape HTTP Cookie File\n.reddit.com\tTRUE\t/\tTRUE\t2145916800\treddit_session\t{reddit_cookie}\n")
-                ydl_opts['cookiefile'] = 'reddit_cookies.txt'
-            elif os.path.exists('reddit_cookies.txt'):
-                ydl_opts['cookiefile'] = 'reddit_cookies.txt'
+        # Add Reddit cookie if available to bypass strict 18+ login walls
+        if ('reddit.com' in url or 'redd.it' in url) and os.path.exists('reddit_cookies.txt'):
+            ydl_opts['cookiefile'] = 'reddit_cookies.txt'
             
         os.makedirs('downloads', exist_ok=True)
         files = []
@@ -742,11 +765,16 @@ def upload_to_gofile(filepath):
     try:
         r = requests.get('https://api.gofile.io/servers')
         if r.status_code == 200:
-            server = r.json()['data']['servers'][0]['name']
+            servers = r.json().get('data', {}).get('servers', [])
+            if not servers:
+                return None
+            server = servers[0].get('name')
+            if not server:
+                return None
             with open(filepath, 'rb') as f:
                 r2 = requests.post(f'https://{server}.gofile.io/contents/uploadfile', files={'file': f})
             if r2.status_code == 200:
-                return r2.json()['data']['downloadPage']
+                return r2.json().get('data', {}).get('downloadPage')
     except Exception as e:
         logger.error(f"Gofile upload error: {e}")
     return None
@@ -766,12 +794,12 @@ async def send_album(message, files, as_files, caption=None):
         
         # If there are large files, upload them to Gofile and notify the user
         for lf in large_files:
-            await message.reply_text("⏳ A file in this album is over 50MB! Uploading the uncompressed original to Gofile...", quote=True)
+            await message.reply_text("⏳ A file in this album is over 50MB! Uploading the uncompressed original to Gofile...")
             cloud_link = upload_to_gofile(lf)
             if cloud_link:
-                await message.reply_text(f"✅ One of the files was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, quote=True)
+                await message.reply_text(f"✅ One of the files was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True)
             else:
-                await message.reply_text("❌ A file was larger than Telegram's 50MB limit and cloud upload failed.", quote=True)
+                await message.reply_text("❌ A file was larger than Telegram's 50MB limit and cloud upload failed.")
                 
         if not valid_files:
             return
@@ -783,7 +811,7 @@ async def send_album(message, files, as_files, caption=None):
                 handles.append(handle)
                 group.append(InputMediaDocument(handle, caption=caption if i == 0 else None, parse_mode='HTML' if caption else None))
             for chunk in chunk_list(group, 10):
-                await message.reply_media_group(media=chunk, quote=True, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
+                await message.reply_media_group(media=chunk, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
         else:
             group = []
             for i, f in enumerate(valid_files):
@@ -797,7 +825,7 @@ async def send_album(message, files, as_files, caption=None):
                 else:
                     group.append(InputMediaPhoto(handle, caption=cap, parse_mode=pm))
             for chunk in chunk_list(group, 10):
-                await message.reply_media_group(media=chunk, quote=True, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
+                await message.reply_media_group(media=chunk, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
     finally:
         for h in handles:
             h.close()
@@ -814,7 +842,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nh_match = re.fullmatch(r'(\d{5,6})', text.strip())
     if nh_match:
         code = nh_match.group(1)
-        reply_msg = await update.message.reply_text("⏳ Fetching doujin info...", quote=True)
+        reply_msg = await update.message.reply_text("⏳ Fetching doujin info...")
         try:
             from curl_cffi import requests as c_requests
             from bs4 import BeautifulSoup
@@ -856,7 +884,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ])
                         
                         with open(cover_path, 'rb') as f:
-                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard, quote=True)
+                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard)
                             
                         os.remove(cover_path)
                         await reply_msg.delete()
@@ -889,7 +917,7 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
     if len(urls) > 1:
         as_files = bool(re.search(r'\s-f\b', text))
         flag_suffix = " -f" if as_files else ""
-        status_msg = await message.reply_text(f"📋 Found {len(urls)} links! Processing them one by one...", quote=True)
+        status_msg = await message.reply_text(f"📋 Found {len(urls)} links! Processing them one by one...")
         succeeded = 0
         failed = 0
         for idx, single_url in enumerate(urls, 1):
@@ -929,7 +957,7 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                 
     media_indices = sorted(list(media_indices)) if media_indices else None
 
-    reply_msg = await message.reply_text("⏳ Processing link...", quote=True)
+    reply_msg = await message.reply_text("⏳ Processing link...")
 
     # Fast zero-bandwidth passthrough for Twitter / X links
     is_twitter = ('twitter.com' in url or 'x.com' in url)
@@ -978,17 +1006,10 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                         caption=caption,
                         parse_mode='HTML',
                         reply_markup=keyboard,
-                        quote=True,
                         read_timeout=300,
                         write_timeout=300
                     )
-                    track_stat(user_id, "downloads", url=url)
-                    remove_failed_download(user_id, url)
-                    record_download_history(user_id, url=url, status="success", title=title, message_id=message.message_id)
-                    try:
-                        await reply_msg.delete()
-                    except:
-                        pass
+                    await _on_download_success(user_id, url=url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                     return True
 
                 # Single video via URL passthrough
@@ -999,7 +1020,7 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                     keyboard = InlineKeyboardMarkup([
                         [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
                     ])
-                    v_kwargs = {'supports_streaming': True, 'read_timeout': 300, 'write_timeout': 300, 'quote': True}
+                    v_kwargs = {'supports_streaming': True, 'read_timeout': 300, 'write_timeout': 300}
                     if item.get('width'): v_kwargs['width'] = item['width']
                     if item.get('height'): v_kwargs['height'] = item['height']
                     try:
@@ -1010,13 +1031,7 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                             reply_markup=keyboard,
                             **v_kwargs
                         )
-                        track_stat(user_id, "downloads", url=url)
-                        remove_failed_download(user_id, url)
-                        record_download_history(user_id, url=url, status="success", title=title, message_id=message.message_id)
-                        try:
-                            await reply_msg.delete()
-                        except:
-                            pass
+                        await _on_download_success(user_id, url=url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                         return True
                     except Exception as e:
                         logger.warning(f"Direct video URL send failed (likely >20MB limit): {e}, falling back to yt-dlp")
@@ -1033,22 +1048,16 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                                 media_group.append(InputMediaPhoto(media=m['url']))
 
                         for chunk in chunk_list(media_group, 10):
-                            await message.reply_media_group(media=chunk, quote=True, read_timeout=300, write_timeout=300)
+                            await message.reply_media_group(media=chunk, read_timeout=300, write_timeout=300)
 
                         buttons = []
                         for idx, m in enumerate(items):
                             buttons.append(InlineKeyboardButton(f"📥 Photo {idx+1} Full-Res", url=m['full_res']))
                         btn_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
                         ctrl_caption = f"📸 <b>Album ({len(items)} photos)</b> • Tap below for uncompressed files:"
-                        await message.reply_text(ctrl_caption, reply_markup=InlineKeyboardMarkup(btn_rows), parse_mode='HTML', quote=True)
+                        await message.reply_text(ctrl_caption, reply_markup=InlineKeyboardMarkup(btn_rows), parse_mode='HTML')
 
-                        track_stat(user_id, "downloads", url=url)
-                        remove_failed_download(user_id, url)
-                        record_download_history(user_id, url=url, status="success", title=title, message_id=message.message_id)
-                        try:
-                            await reply_msg.delete()
-                        except:
-                            pass
+                        await _on_download_success(user_id, url=url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                         return True
                     except Exception as e:
                         logger.warning(f"Direct album send failed: {e}, falling back to yt-dlp")
@@ -1086,15 +1095,8 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                         await reply_msg.edit_text("⏳ File is over 50MB! Uploading the uncompressed original to Gofile...")
                         cloud_link = upload_to_gofile(f)
                         if cloud_link:
-                            try:
-                                await reply_msg.delete()
-                            except:
-                                pass
-                            await message.reply_text(f"{caption}\n\n✅ File was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, parse_mode='HTML', quote=True)
-                            track_stat(user_id, "downloads", url=original_url)
-                            remove_failed_download(user_id, url)
-                            remove_failed_download(user_id, original_url)
-                            record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
+                            await message.reply_text(f"{caption}\n\n✅ File was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, parse_mode='HTML')
+                            await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                             return True
                         else:
                             add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
@@ -1107,29 +1109,22 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                             
                     with open(f, 'rb') as doc:
                         if as_files:
-                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', quote=True, read_timeout=300, write_timeout=300)
+                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
                         elif f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
                             w, h = get_video_dimensions(f)
-                            await message.reply_video(video=doc, caption=caption, parse_mode='HTML', quote=True, width=w, height=h, supports_streaming=True, read_timeout=300, write_timeout=300)
+                            await message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, read_timeout=300, write_timeout=300)
                         elif f.endswith(('.jpg', '.png', '.jpeg')):
-                            await message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', quote=True, read_timeout=300, write_timeout=300)
+                            await message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
                         else:
-                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', quote=True, read_timeout=300, write_timeout=300)
+                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
             except Exception as e:
                 logger.error(f"Failed to send file: {e}")
                 if ("timed out" in str(e).lower() or "timeout" in str(e).lower()) and not as_files:
                     try:
                         logger.info("Upload timed out, retrying send as document...")
                         with open(f, 'rb') as doc:
-                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', quote=True, read_timeout=300, write_timeout=300)
-                        track_stat(user_id, "downloads", url=original_url)
-                        remove_failed_download(user_id, url)
-                        remove_failed_download(user_id, original_url)
-                        record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
-                        try:
-                            await reply_msg.delete()
-                        except:
-                            pass
+                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
+                        await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                         return True
                     except Exception as retry_e:
                         logger.error(f"Retry as document failed: {retry_e}")
@@ -1143,26 +1138,12 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
             finally:
                 if os.path.exists(f):
                     os.remove(f)
-            track_stat(user_id, "downloads", url=original_url)
-            remove_failed_download(user_id, url)
-            remove_failed_download(user_id, original_url)
-            record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
-            try:
-                await reply_msg.delete()
-            except:
-                pass
+            await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
             return True
         else:
             try:
                 await send_album(message, files, as_files, caption)
-                track_stat(user_id, "downloads", url=original_url)
-                remove_failed_download(user_id, url)
-                remove_failed_download(user_id, original_url)
-                record_download_history(user_id, url=original_url, status="success", title=title, message_id=message.message_id)
-                try:
-                    await reply_msg.delete()
-                except:
-                    pass
+                await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                 return True
             except Exception as e:
                 logger.error(f"Failed to send album: {e}")
@@ -1267,7 +1248,7 @@ async def handle_replied_link(message, reply_to, url: str, user_text: str, user_
             [InlineKeyboardButton("🔄 Download Again", callback_data=f"redl_std_{token}")],
             [InlineKeyboardButton("📥 Download as File (-f)", callback_data=f"redl_doc_{token}")]
         ])
-        await message.reply_text(reply_card, reply_markup=keyboard, parse_mode="HTML", quote=True)
+        await message.reply_text(reply_card, reply_markup=keyboard, parse_mode="HTML")
         return
 
     # Otherwise: It failed, or was not completed, or user requested re-download.
@@ -1281,8 +1262,7 @@ async def handle_replied_link(message, reply_to, url: str, user_text: str, user_
         
     status_msg = await message.reply_text(
         f"{status_note}🚀 <b>Taking it from here... Downloading now!</b>",
-        parse_mode="HTML",
-        quote=True
+        parse_mode="HTML"
     )
     
     clean_user_opts = user_text.replace(url, '').strip()
@@ -1303,7 +1283,7 @@ async def redl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     url_info = redl_cache.get(token)
     if not url_info:
-        await query.message.reply_text("⚠️ This download session expired. Please reply to the link again.", quote=True)
+        await query.message.reply_text("⚠️ This download session expired. Please reply to the link again.")
         return
         
     url = url_info.get('url')
@@ -1329,13 +1309,13 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if args and args[0].lower() in ['clear', 'reset']:
         clear_failed_queue(user_id)
-        await update.message.reply_text("🧹 Cleared your failed retry list.", quote=True)
+        await update.message.reply_text("🧹 Cleared your failed retry list.")
         return
     
     if args and args[0].lower() in ['list', 'show']:
         items = get_failed_queue(user_id)
         if not items:
-            await update.message.reply_text("✨ You have no failed downloads queued.", quote=True)
+            await update.message.reply_text("✨ You have no failed downloads queued.")
             return
         lines = [f"📋 <b>Failed Downloads ({len(items)}):</b>\n"]
         for idx, item in enumerate(items, 1):
@@ -1344,15 +1324,15 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_str = item.get('time', '')
             lines.append(f"{idx}. 🔗 {html.escape(url_display)}\n   ⚠️ <i>{html.escape(reason)}</i> ({html.escape(time_str)})")
         lines.append("\n<i>Send /retry to attempt downloading these again, or /retry clear to reset.</i>")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True, quote=True)
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
         return
 
     items = get_failed_queue(user_id)
     if not items:
-        await update.message.reply_text("✨ You have no failed downloads to retry!", quote=True)
+        await update.message.reply_text("✨ You have no failed downloads to retry!")
         return
 
-    status_msg = await update.message.reply_text(f"🔄 Retrying {len(items)} failed download(s)...", quote=True)
+    status_msg = await update.message.reply_text(f"🔄 Retrying {len(items)} failed download(s)...")
     succeeded = 0
     failed = 0
     for item in list(items):
@@ -1380,7 +1360,7 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_msg_id = message.message_id
     bot = context.bot
 
-    status_msg = await message.reply_text("🧹 Cleaning up bot messages... Your links will remain untouched.", quote=True)
+    status_msg = await message.reply_text("🧹 Cleaning up bot messages... Your links will remain untouched.")
 
     deleted_count = 0
     # Sweep backwards through up to 300 recent message IDs
@@ -2078,6 +2058,15 @@ async def manga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_msg.edit_text(f"❌ Error searching MangaKatana. ({VERSION})")
 
 
+def _safe_manga_cb(manga_id, max_len=35):
+    if len(manga_id) <= max_len:
+        return manga_id
+    if '.' in manga_id:
+        slug, mid = manga_id.rsplit('.', 1)
+        avail = max_len - len(mid) - 1
+        return f"{slug[:max(1, avail)]}.{mid}"
+    return manga_id[:max_len]
+
 def _build_chapter_keyboard(chapters, manga_id, page):
     """Build paginated chapter list keyboard."""
     PER_PAGE = 10
@@ -2085,20 +2074,22 @@ def _build_chapter_keyboard(chapters, manga_id, page):
     end = start + PER_PAGE
     current = chapters[start:end]
 
+    safe_id = _safe_manga_cb(manga_id, 35)
+
     keyboard = []
     for ch in current:
         title = ch["title"]
         ch_url = ch["url"]
         ch_suffix = ch_url.split('/')[-1]
         label = title[:50]
-        cb_data = f"mg_dl_{manga_id[:35]}::{ch_suffix[:15]}"
+        cb_data = f"mg_dl_{safe_id}::{ch_suffix[:15]}"
         keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mg_chp_{manga_id[:40]}_{page - 1}"))
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mg_chp_{safe_id}_{page - 1}"))
     if end < len(chapters):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mg_chp_{manga_id[:40]}_{page + 1}"))
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mg_chp_{safe_id}_{page + 1}"))
     if nav:
         keyboard.append(nav)
 
@@ -2110,8 +2101,6 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
-    from bs4 import BeautifulSoup
 
     # ── User selected a manga from search results ──
     if data.startswith("mg_sel_"):
@@ -2150,10 +2139,25 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("mg_chp_"):
         parts = data[7:].rsplit("_", 1)
         manga_id, page = parts[0], int(parts[1])
-        chapters = context.user_data.get(f"mg_chapters_{manga_id}", [])
+        chapters = context.user_data.get(f"mg_chapters_{manga_id}")
+        if not chapters:
+            try:
+                r = await asyncio.to_thread(
+                    requests.get, f"https://mangakatana.com/manga/{manga_id}",
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+                )
+                soup = BeautifulSoup(r.text, 'html.parser')
+                chapters_tags = list(reversed(soup.select('.chapters .chapter a')))
+                if chapters_tags:
+                    chapters = [{"title": c.text.strip(), "url": c['href']} for c in chapters_tags]
+                    context.user_data[f"mg_chapters_{manga_id}"] = chapters
+            except Exception:
+                pass
+
         if not chapters:
             await query.edit_message_text("❌ Session expired. Please search again with /manga.")
             return
+
         keyboard = _build_chapter_keyboard(chapters, manga_id, page)
         await query.edit_message_text(
             f"📖 <b>{len(chapters)} chapters found.</b>\n<i>Select a chapter to download:</i>",
@@ -2178,38 +2182,53 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 headers={"User-Agent": "Mozilla/5.0"}, timeout=15
             )
             
-            m = re.search(r'var thzq=\[(.*?)\];', r.text)
-            if not m:
-                m = re.search(r'var ytaw=\[(.*?)\];', r.text)
-            if not m:
+            img_urls = []
+            for arr_match in re.finditer(r'var\s+[a-zA-Z0-9_]+\s*=\s*\[(.*?)\];', r.text):
+                content = arr_match.group(1)
+                if 'http' in content:
+                    img_urls = [u.strip("'\"") for u in content.split(',') if 'http' in u]
+                    break
+
+            if not img_urls:
                 await query.edit_message_text("❌ Could not extract images from chapter page.")
                 return
-                
-            img_urls = [u.strip("'\"") for u in m.group(1).split(',')]
 
-            # Download all page images into a .cbz (zip) in memory
+            await query.edit_message_text(f"⏳ Downloading {len(img_urls)} pages in parallel...")
+
+            # Download all page images into a .cbz (zip) using concurrent tasks
             os.makedirs("downloads", exist_ok=True)
             safe_title = re.sub(r'[^\w\s-]', '', manga_id)[:40].strip()
+            cbz_dir = f"downloads/mg_{uuid.uuid4().hex[:8]}"
+            os.makedirs(cbz_dir, exist_ok=True)
             cbz_filename = f"downloads/{safe_title}_{ch_suffix}.cbz"
 
-            with zipfile.ZipFile(cbz_filename, "w", zipfile.ZIP_STORED) as zf:
-                for i, img_url in enumerate(img_urls):
-                    img_r = await asyncio.to_thread(
-                        requests.get, img_url,
-                        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mangakatana.com/"}, 
-                        timeout=30
-                    )
-                    if img_r.status_code == 200:
-                        ext = img_url.split(".")[-1]
-                        if len(ext) > 4 or not ext: ext = "jpg"
-                        zf.writestr(f"{i+1:04d}.{ext}", img_r.content)
+            sem = asyncio.Semaphore(15)
+            async def fetch_page(idx, url):
+                async with sem:
+                    try:
+                        img_r = await asyncio.to_thread(
+                            requests.get, url,
+                            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mangakatana.com/"},
+                            timeout=25
+                        )
+                        if img_r.status_code == 200:
+                            ext = url.split(".")[-1].split("?")[0]
+                            if len(ext) > 4 or not ext: ext = "jpg"
+                            fpath = os.path.join(cbz_dir, f"{idx:04d}.{ext}")
+                            with open(fpath, "wb") as pf:
+                                pf.write(img_r.content)
+                    except Exception as fe:
+                        logger.warning(f"Error fetching page {idx}: {fe}")
 
-                    # Update progress every 10 pages
-                    if (i + 1) % 10 == 0:
-                        try:
-                            await query.edit_message_text(f"⏳ Downloading... {i+1}/{len(img_urls)} pages")
-                        except Exception:
-                            pass
+            tasks = [fetch_page(i, u) for i, u in enumerate(img_urls, 1)]
+            await asyncio.gather(*tasks)
+
+            with zipfile.ZipFile(cbz_filename, "w", zipfile.ZIP_STORED) as zf:
+                for fname in sorted(os.listdir(cbz_dir)):
+                    zf.write(os.path.join(cbz_dir, fname), fname)
+
+            import shutil
+            shutil.rmtree(cbz_dir, ignore_errors=True)
 
             file_size = os.path.getsize(cbz_filename)
             caption = f"📖 <b>{manga_id} - {ch_suffix}</b>\n📄 {len(img_urls)} pages\n\n🤖 <i>{VERSION}</i>"
