@@ -845,6 +845,22 @@ async def send_album(message, files, as_files, caption=None):
             for chunk in chunk_list(group, 10):
                 await message.reply_media_group(media=chunk, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
         else:
+            anim_files = [f for f in valid_files if ('anim_' in os.path.basename(f)) or f.lower().endswith('.gif')]
+            if anim_files and len(anim_files) == len(valid_files):
+                # When all files are animations, send each as a native Telegram GIF
+                # (Telegram's sendMediaGroup does not support animations and forces them into video players)
+                for idx, f in enumerate(anim_files):
+                    w, h = get_video_dimensions(f)
+                    v_kw = {'read_timeout': 300, 'write_timeout': 300}
+                    if w: v_kw['width'] = w
+                    if h: v_kw['height'] = h
+                    cap = caption if idx == 0 else None
+                    pm = 'HTML' if cap else None
+                    handle = open(f, 'rb')
+                    handles.append(handle)
+                    await message.reply_animation(animation=handle, caption=cap, parse_mode=pm, allow_sending_without_reply=True, **v_kw)
+                return
+
             group = []
             for i, f in enumerate(valid_files):
                 handle = open(f, 'rb')
