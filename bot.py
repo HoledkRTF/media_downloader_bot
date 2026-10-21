@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 
-VERSION = "v2.8.0"
+VERSION = "v2.9.0"
 
 # Enable logging
 logging.basicConfig(
@@ -738,6 +738,8 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
             raise e
 
     files = await asyncio.to_thread(_download)
+    if not as_files and files:
+        files = await asyncio.to_thread(lambda: [convert_gif_to_mp4(f) for f in files])
     return files, title, original_url
 
 def chunk_list(lst, n):
@@ -759,6 +761,34 @@ def get_video_dimensions(filepath):
     except Exception:
         pass
     return None, None
+
+def convert_gif_to_mp4(gif_path):
+    """Convert GIF to streamable H.264 MP4. Returns converted mp4 path if successful, else original path."""
+    if not gif_path or not gif_path.lower().endswith('.gif'):
+        return gif_path
+    dirname = os.path.dirname(gif_path) or 'downloads'
+    basename = os.path.basename(gif_path)
+    stem = os.path.splitext(basename)[0]
+    out_path = os.path.join(dirname, f"anim_{stem}.mp4")
+    try:
+        cmd = [
+            'ffmpeg', '-y', '-i', gif_path,
+            '-movflags', 'faststart',
+            '-pix_fmt', 'yuv420p',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            out_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if os.path.exists(gif_path):
+                try:
+                    os.remove(gif_path)
+                except Exception:
+                    pass
+            return out_path
+    except Exception as e:
+        logger.warning(f"Failed to convert gif to mp4: {e}")
+    return gif_path
 
 def upload_to_gofile(filepath):
     """Upload large file to gofile.io and return direct link to the download page."""
@@ -783,6 +813,8 @@ async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
     handles = []
     try:
+        if not as_files and files:
+            files = [convert_gif_to_mp4(f) for f in files]
         # Check files for size limit. Any file > 50MB gets sent to Gofile instead.
         large_files = []
         valid_files = []
@@ -1024,13 +1056,23 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                     if item.get('width'): v_kwargs['width'] = item['width']
                     if item.get('height'): v_kwargs['height'] = item['height']
                     try:
-                        await message.reply_video(
-                            video=item['url'],
-                            caption=caption,
-                            parse_mode='HTML',
-                            reply_markup=keyboard,
-                            **v_kwargs
-                        )
+                        if item['type'] == 'gif':
+                            await message.reply_animation(
+                                animation=item['url'],
+                                caption=caption,
+                                parse_mode='HTML',
+                                reply_markup=keyboard,
+                                **v_kwargs
+                            )
+                        else:
+                            await message.reply_video(
+                                video=item['url'],
+                                caption=caption,
+                                parse_mode='HTML',
+                                reply_markup=keyboard,
+                                supports_streaming=True,
+                                **v_kwargs
+                            )
                         await _on_download_success(user_id, url=url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                         return True
                     except Exception as e:
@@ -1110,7 +1152,13 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                     with open(f, 'rb') as doc:
                         if as_files:
                             await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
-                        elif f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
+                        elif ('anim_' in os.path.basename(f)) or f.lower().endswith('.gif'):
+                            w, h = get_video_dimensions(f)
+                            v_kw = {'read_timeout': 300, 'write_timeout': 300}
+                            if w: v_kw['width'] = w
+                            if h: v_kw['height'] = h
+                            await message.reply_animation(animation=doc, caption=caption, parse_mode='HTML', **v_kw)
+                        elif f.endswith(('.mp4', '.webm', '.mkv')):
                             w, h = get_video_dimensions(f)
                             await message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, read_timeout=300, write_timeout=300)
                         elif f.endswith(('.jpg', '.png', '.jpeg')):
