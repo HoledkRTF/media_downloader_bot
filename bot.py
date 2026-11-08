@@ -19,7 +19,7 @@ from pymongo import MongoClient
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "v2.12.0"
+VERSION = "v2.13.0"
 
 # Enable logging
 logging.basicConfig(
@@ -69,10 +69,18 @@ if MONGO_URI:
     stats_col = db['stats']
     retry_col = db['retry_queue']
     history_col = db['download_history']
+    try:
+        history_col.create_index([("user_id", 1), ("norm_key", 1)], background=True)
+        history_col.create_index([("timestamp", -1)], background=True)
+        retry_col.create_index([("user_id", 1)], background=True)
+    except Exception as e:
+        logger.warning(f"Could not initialize mongo indexes: {e}")
 else:
     mongo_client = None
     retry_col = None
     history_col = None
+
+inflight_downloads = set()
 
 def track_stat(user_id, field="downloads", url=None):
     if not mongo_client: return
@@ -282,7 +290,7 @@ def get_download_history_item(user_id, url):
             doc = history_col.find_one({
                 "user_id": str(user_id),
                 "$or": [{"norm_key": norm_key}, {"url": url}]
-            })
+            }, {"_id": 0, "status": 1, "title": 1, "time_display": 1, "error": 1})
             return doc
         else:
             if os.path.exists('download_history.json'):
@@ -544,15 +552,15 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
         try:
             s = requests.Session()
             s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-            s.get('https://old.reddit.com/')
+            s.get('https://old.reddit.com/', timeout=8)
 
-            res = s.get(url, allow_redirects=True)
+            res = s.get(url, allow_redirects=True, timeout=10)
             full_url = res.url.split('?')[0]
             if not full_url.endswith('/'):
                 full_url += '/'
             json_url = full_url + '.json'
 
-            res = s.get(json_url)
+            res = s.get(json_url, timeout=10)
             if res.status_code != 200:
                 return [], None
 
@@ -688,7 +696,7 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                         title = data['data'].get('title', '')
                         
                         os.makedirs('downloads', exist_ok=True)
-                        m_res = requests.get(play_url, headers={'User-Agent': 'Mozilla/5.0'})
+                        m_res = requests.get(play_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
                         if m_res.status_code == 200:
                             filename = f"downloads/tiktok_{uuid.uuid4().hex}.mp4"
                             with open(filename, 'wb') as f:
@@ -884,7 +892,7 @@ def convert_gif_to_mp4(gif_path):
 def upload_to_gofile(filepath):
     """Upload large file to gofile.io and return direct link to the download page."""
     try:
-        r = requests.get('https://api.gofile.io/servers')
+        r = requests.get('https://api.gofile.io/servers', timeout=10)
         if r.status_code == 200:
             servers = r.json().get('data', {}).get('servers', [])
             if not servers:
@@ -893,7 +901,7 @@ def upload_to_gofile(filepath):
             if not server:
                 return None
             with open(filepath, 'rb') as f:
-                r2 = requests.post(f'https://{server}.gofile.io/contents/uploadfile', files={'file': f})
+                r2 = requests.post(f'https://{server}.gofile.io/contents/uploadfile', files={'file': f}, timeout=120)
             if r2.status_code == 200:
                 return r2.json().get('data', {}).get('downloadPage')
     except Exception as e:
@@ -1113,6 +1121,19 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
     return await process_single_link(message, urls[0], text, user_id)
 
 async def process_single_link(message, url: str, text: str, user_id: int) -> bool:
+    norm_key = normalize_history_url(url)
+    flight_id = (user_id, norm_key)
+    if flight_id in inflight_downloads:
+        await message.reply_text("⏳ This media item is already currently being downloaded. Please hold on!")
+        return True
+
+    inflight_downloads.add(flight_id)
+    try:
+        return await _process_single_link_impl(message, url, text, user_id)
+    finally:
+        inflight_downloads.discard(flight_id)
+
+async def _process_single_link_impl(message, url: str, text: str, user_id: int) -> bool:
     as_files = bool(re.search(r'\s-f\b', text))
 
     clean_text = text.replace(url, '').replace('-f', '').strip()
@@ -1610,7 +1631,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 res = requests.post(
                     f"https://api.telegram.org/bot{TOKEN}/setMyProfilePhoto",
                     data=payload,
-                    files=files
+                    files=files,
+                    timeout=15
                 )
             if res.status_code == 200 and res.json().get('ok'):
                 await update.message.reply_text("✅ Profile picture updated successfully.")
