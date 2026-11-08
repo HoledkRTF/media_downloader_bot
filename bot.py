@@ -15,6 +15,7 @@ from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocumen
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter, TelegramError
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
@@ -2587,8 +2588,18 @@ async def main():
     
     is_render = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
     if is_render:
-        # Set Telegram Webhook to point to Render
-        await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
+        # Set Telegram Webhook to point to Render with flood-control retry
+        for attempt in range(5):
+            try:
+                await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
+                logger.info(f"Telegram webhook set successfully to {RENDER_URL}/webhook")
+                break
+            except RetryAfter as ra:
+                logger.warning(f"Webhook flood control exceeded. Retrying after {ra.retry_after}s...")
+                await asyncio.sleep(ra.retry_after + 1)
+            except Exception as e:
+                logger.warning(f"Could not set webhook on attempt {attempt+1}: {e}")
+                await asyncio.sleep(2)
 
         async def health_check(request):
             return web.Response(text="Bot is running!")
