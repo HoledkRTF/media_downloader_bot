@@ -16,8 +16,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "v2.9.0"
+VERSION = "v2.10.0"
 
 # Enable logging
 logging.basicConfig(
@@ -409,6 +410,43 @@ def fetch_twitter_details(url):
         logger.error(f"vxtwitter API error in fetch_twitter_details: {e}")
     return None
 
+def _download_media_urls_parallel(media_items, session=None, max_workers=8):
+    """Downloads a list of URLs or (url, ext_hint) tuples in parallel preserving order."""
+    if not media_items:
+        return []
+    os.makedirs('downloads', exist_ok=True)
+    s = session or requests.Session()
+    s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+
+    def _download_one(item):
+        if isinstance(item, (list, tuple)):
+            m_url, ext_hint = item[0], item[1]
+        else:
+            m_url, ext_hint = item, None
+        try:
+            m_res = s.get(m_url, timeout=15)
+            if m_res.status_code == 200:
+                ct = m_res.headers.get('content-type', '').lower()
+                if 'html' in ct or 'text' in ct:
+                    return None
+                ext = ext_hint
+                if not ext:
+                    ext = m_url.split('.')[-1].split('?')[0].lower()
+                    if len(ext) > 4 or not ext:
+                        ext = 'jpg'
+                fname = f"downloads/reddit_{uuid.uuid4().hex}.{ext}"
+                with open(fname, 'wb') as f:
+                    f.write(m_res.content)
+                return fname
+        except Exception as e:
+            logger.warning(f"Failed to download gallery item {m_url}: {e}")
+        return None
+
+    workers = min(max_workers, max(1, len(media_items)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(_download_one, media_items))
+    return [f for f in results if f]
+
 async def download_media(url: str, media_indices: list = None, as_files: bool = False):
     """Returns (files, title, original_url)"""
     title = None
@@ -471,20 +509,7 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                                 filtered.append(image_urls[idx - 1])
                         image_urls = filtered
 
-                    files = []
-                    os.makedirs('downloads', exist_ok=True)
-                    for m_url in image_urls:
-                        m_res = s.get(m_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-                        if m_res.status_code == 200:
-                            ct = m_res.headers.get('content-type', '').lower()
-                            if 'html' in ct or 'text' in ct:
-                                continue
-                            ext = m_url.split('.')[-1].split('?')[0]
-                            if len(ext) > 4 or not ext: ext = 'jpg'
-                            fname = f'downloads/reddit_{uuid.uuid4().hex}.{ext}'
-                            with open(fname, 'wb') as f:
-                                f.write(m_res.content)
-                            files.append(fname)
+                    files = _download_media_urls_parallel(image_urls, session=s)
                     if files:
                         return files, None
         except Exception as e:
@@ -561,18 +586,7 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                         filtered_urls.append(media_urls[idx - 1])
                 media_urls = filtered_urls
 
-            files = []
-            os.makedirs('downloads', exist_ok=True)
-            for m_url, ext in media_urls:
-                m_res = s.get(m_url)
-                if m_res.status_code == 200:
-                    ct = m_res.headers.get('content-type', '').lower()
-                    if 'html' in ct or 'text' in ct:
-                        continue
-                    filename = f"downloads/reddit_{uuid.uuid4().hex}.{ext}"
-                    with open(filename, 'wb') as f:
-                        f.write(m_res.content)
-                    files.append(filename)
+            files = _download_media_urls_parallel(media_urls, session=s)
             return files, None
         except Exception as e:
             logger.error(f"Fallback reddit failed: {e}")
@@ -616,21 +630,7 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                         filtered_urls.append(media_urls[idx - 1])
                 media_urls = filtered_urls
 
-            files = []
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-            os.makedirs('downloads', exist_ok=True)
-            for m_url in media_urls:
-                m_res = requests.get(m_url, headers=headers)
-                if m_res.status_code == 200:
-                    ct = m_res.headers.get('content-type', '').lower()
-                    if 'html' in ct or 'text' in ct:
-                        continue
-                    ext = m_url.split('.')[-1].split('?')[0]
-                    if len(ext) > 4 or not ext: ext = 'jpg'
-                    filename = f"downloads/fallback_{uuid.uuid4().hex}.{ext}"
-                    with open(filename, 'wb') as f:
-                        f.write(m_res.content)
-                    files.append(filename)
+            files = _download_media_urls_parallel(media_urls)
             return files
         except Exception as e:
             logger.error(f"Fallback failed: {e}")
@@ -739,7 +739,13 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
 
     files = await asyncio.to_thread(_download)
     if not as_files and files:
-        files = await asyncio.to_thread(lambda: [convert_gif_to_mp4(f) for f in files])
+        def _batch_convert(file_list):
+            has_gifs = any(f.lower().endswith('.gif') for f in file_list)
+            if not has_gifs:
+                return file_list
+            with ThreadPoolExecutor(max_workers=min(3, len(file_list))) as executor:
+                return list(executor.map(convert_gif_to_mp4, file_list))
+        files = await asyncio.to_thread(_batch_convert, files)
     return files, title, original_url
 
 def chunk_list(lst, n):
@@ -773,7 +779,8 @@ def convert_gif_to_mp4(gif_path):
     try:
         cmd = [
             'ffmpeg', '-y', '-i', gif_path,
-            '-movflags', 'faststart',
+            '-c:v', 'libx264', '-preset', 'faster', '-crf', '24',
+            '-an', '-movflags', 'faststart',
             '-pix_fmt', 'yuv420p',
             '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
             out_path
@@ -849,8 +856,12 @@ async def send_album(message, files, as_files, caption=None):
             if anim_files and len(anim_files) == len(valid_files):
                 # When all files are animations, send each as a native Telegram GIF
                 # (Telegram's sendMediaGroup does not support animations and forces them into video players)
+                with ThreadPoolExecutor(max_workers=min(6, len(anim_files))) as ex:
+                    dim_results = list(ex.map(get_video_dimensions, anim_files))
+                dim_map = dict(zip(anim_files, dim_results))
+
                 for idx, f in enumerate(anim_files):
-                    w, h = get_video_dimensions(f)
+                    w, h = dim_map.get(f, (None, None))
                     v_kw = {'read_timeout': 300, 'write_timeout': 300}
                     if w: v_kw['width'] = w
                     if h: v_kw['height'] = h
@@ -862,13 +873,17 @@ async def send_album(message, files, as_files, caption=None):
                 return
 
             group = []
+            with ThreadPoolExecutor(max_workers=min(6, len(valid_files))) as ex:
+                dim_results = list(ex.map(get_video_dimensions, valid_files))
+            dim_map = dict(zip(valid_files, dim_results))
+
             for i, f in enumerate(valid_files):
                 handle = open(f, 'rb')
                 handles.append(handle)
                 cap = caption if i == 0 else None
                 pm = 'HTML' if cap else None
                 if f.endswith(('.mp4', '.webm', '.mkv', '.gif')):
-                    w, h = get_video_dimensions(f)
+                    w, h = dim_map.get(f, (None, None))
                     group.append(InputMediaVideo(handle, caption=cap, parse_mode=pm, width=w, height=h, supports_streaming=True))
                 else:
                     group.append(InputMediaPhoto(handle, caption=cap, parse_mode=pm))
