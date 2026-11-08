@@ -18,7 +18,7 @@ from pymongo import MongoClient
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "v2.10.0"
+VERSION = "v2.11.0"
 
 # Enable logging
 logging.basicConfig(
@@ -33,10 +33,18 @@ RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-skg5
 
 def _ensure_cookies():
     ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
-    if ig_cookie and not os.path.exists('ig_cookies.txt'):
+    if ig_cookie:
         try:
+            lines = [
+                "# Netscape HTTP Cookie File\n",
+                f".instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n"
+            ]
+            if '%3A' in ig_cookie or ':' in ig_cookie:
+                uid = ig_cookie.split('%3A')[0].split(':')[0]
+                if uid.isdigit():
+                    lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2145916800\tds_user_id\t{uid}\n")
             with open('ig_cookies.txt', 'w', encoding='utf-8') as f:
-                f.write(f"# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2145916800\tsessionid\t{ig_cookie}\n")
+                f.writelines(lines)
         except Exception:
             pass
 
@@ -566,10 +574,10 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                         s_info = media_dict[media_id]['s']
                         if 'mp4' in s_info:
                             media_urls.append((s_info['mp4'].replace('&amp;', '&'), 'mp4'))
-                        elif 'u' in s_info:
-                            media_urls.append((s_info['u'].replace('&amp;', '&'), 'jpg'))
                         elif 'gif' in s_info:
                             media_urls.append((s_info['gif'].replace('&amp;', '&'), 'gif'))
+                        elif 'u' in s_info:
+                            media_urls.append((s_info['u'].replace('&amp;', '&'), 'jpg'))
             elif 'url_overridden_by_dest' in post:
                 m_url = post['url_overridden_by_dest']
                 if m_url.endswith(('.jpg', '.jpeg', '.png', '.gif')) or 'i.redd.it' in m_url:
@@ -746,7 +754,31 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
             with ThreadPoolExecutor(max_workers=min(3, len(file_list))) as executor:
                 return list(executor.map(convert_gif_to_mp4, file_list))
         files = await asyncio.to_thread(_batch_convert, files)
+
+    if files:
+        resolved = []
+        for f in files:
+            rf = resolve_downloaded_file(f)
+            if rf:
+                resolved.append(rf)
+            else:
+                logger.warning(f"File {f} not found on disk after download")
+        files = resolved
+
     return files, title, original_url
+
+def resolve_downloaded_file(filepath):
+    """Finds the actual file on disk if yt-dlp or ffmpeg merged/converted extensions."""
+    if not filepath:
+        return None
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+        return filepath
+    base, _ = os.path.splitext(filepath)
+    for ext in ['.mp4', '.mkv', '.webm', '.jpg', '.jpeg', '.png', '.gif']:
+        candidate = base + ext
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return candidate
+    return None
 
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
@@ -820,16 +852,20 @@ async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
     handles = []
     try:
-        if not as_files and files:
-            files = [convert_gif_to_mp4(f) for f in files]
+        if not as_files and files and any(f.lower().endswith('.gif') for f in files):
+            with ThreadPoolExecutor(max_workers=min(3, len(files))) as ex:
+                files = list(ex.map(convert_gif_to_mp4, files))
         # Check files for size limit. Any file > 50MB gets sent to Gofile instead.
         large_files = []
         valid_files = []
         for f in files:
-            if os.path.exists(f) and os.path.getsize(f) > 50 * 1024 * 1024:
-                large_files.append(f)
+            rf = resolve_downloaded_file(f)
+            if not rf:
+                continue
+            if os.path.getsize(rf) > 50 * 1024 * 1024:
+                large_files.append(rf)
             else:
-                valid_files.append(f)
+                valid_files.append(rf)
         
         # If there are large files, upload them to Gofile and notify the user
         for lf in large_files:
@@ -960,7 +996,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check if current message has its own links
-    new_urls = re.findall(r'(https?://\S+)', text)
+    new_urls = extract_urls_from_message(message)
 
     # If the user did NOT send a new link, BUT replied to an existing message:
     if not new_urls and reply_to:
@@ -973,7 +1009,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await process_media_request(message, text, user_id)
 
 async def process_media_request(message, text: str, user_id: int) -> bool:
-    urls = re.findall(r'(https?://\S+)', text)
+    urls = extract_urls_from_message(message)
+    if not urls:
+        raw_urls = re.findall(r'(https?://[^\s<>"]+)', text)
+        urls = [u.rstrip(').,;!?') for u in raw_urls if u]
     if not urls:
         return False
 
@@ -1162,25 +1201,32 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
 
         if len(files) == 1:
             f = files[0]
+            if not os.path.exists(f) or os.path.getsize(f) == 0:
+                add_failed_download(user_id, url, text, "File empty or missing after download")
+                record_download_history(user_id, url=url, status="failed", error="File empty or missing after download", message_id=message.message_id)
+                try:
+                    await reply_msg.delete()
+                except Exception:
+                    pass
+                return False
             try:
-                if os.path.exists(f) and os.path.getsize(f) > 0:
-                    if os.path.getsize(f) > 50 * 1024 * 1024:
-                        await reply_msg.edit_text("⏳ File is over 50MB! Uploading the uncompressed original to Gofile...")
-                        cloud_link = upload_to_gofile(f)
-                        if cloud_link:
-                            await message.reply_text(f"{caption}\n\n✅ File was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, parse_mode='HTML')
-                            await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
-                            return True
-                        else:
-                            add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
-                            record_download_history(user_id, url=url, status="failed", error="File >50MB and cloud upload failed", message_id=message.message_id)
-                            try:
-                                await reply_msg.delete()
-                            except Exception:
-                                pass
-                            return False
-                            
-                    with open(f, 'rb') as doc:
+                if os.path.getsize(f) > 50 * 1024 * 1024:
+                    await reply_msg.edit_text("⏳ File is over 50MB! Uploading the uncompressed original to Gofile...")
+                    cloud_link = upload_to_gofile(f)
+                    if cloud_link:
+                        await message.reply_text(f"{caption}\n\n✅ File was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, parse_mode='HTML')
+                        await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
+                        return True
+                    else:
+                        add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
+                        record_download_history(user_id, url=url, status="failed", error="File >50MB and cloud upload failed", message_id=message.message_id)
+                        try:
+                            await reply_msg.delete()
+                        except Exception:
+                            pass
+                        return False
+                        
+                with open(f, 'rb') as doc:
                         if as_files:
                             await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
                         elif ('anim_' in os.path.basename(f)) or f.lower().endswith('.gif'):
@@ -1627,6 +1673,8 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         original_caption = query.message.caption or ""
         await query.edit_message_caption(caption=original_caption + "\n\n⏳ Downloading pages...")
         
+        cbz_dir = None
+        cbz_path = None
         try:
             from curl_cffi import requests as c_requests
             from bs4 import BeautifulSoup
@@ -1647,6 +1695,7 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     image_urls.append(full_url)
                     
             cbz_dir = f"downloads/nh_{code}"
+            cbz_path = f"downloads/nh_{code}.cbz"
             os.makedirs(cbz_dir, exist_ok=True)
             
             async def fetch_page(idx, url, sem):
@@ -1661,7 +1710,6 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tasks = [fetch_page(i, url, sem) for i, url in enumerate(image_urls, 1)]
             await asyncio.gather(*tasks)
             
-            cbz_path = f"downloads/nh_{code}.cbz"
             with zipfile.ZipFile(cbz_path, 'w') as zf:
                 for f in os.listdir(cbz_dir):
                     zf.write(os.path.join(cbz_dir, f), f)
@@ -1679,28 +1727,37 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_document(chat_id=query.message.chat_id, document=f)
                 track_stat(query.from_user.id, "downloads")
                 await query.edit_message_caption(caption=original_caption)
-                
-            import shutil
-            shutil.rmtree(cbz_dir, ignore_errors=True)
-            if os.path.exists(cbz_path): os.remove(cbz_path)
-            
         except Exception as e:
             logger.error(f"nHentai DL Error: {e}")
             await query.edit_message_caption(caption=original_caption + "\n❌ Error downloading CBZ.")
+        finally:
+            if cbz_dir:
+                import shutil
+                shutil.rmtree(cbz_dir, ignore_errors=True)
+            if cbz_path and os.path.exists(cbz_path):
+                try:
+                    os.remove(cbz_path)
+                except Exception:
+                    pass
         return
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic cleanup of orphan files in downloads/"""
+    """Periodic cleanup of orphan files and directories in downloads/"""
     if os.path.exists('downloads'):
+        import shutil
         now = time.time()
         for f in os.listdir('downloads'):
             f_path = os.path.join('downloads', f)
-            if os.path.isfile(f_path) and now - os.path.getmtime(f_path) > 600:
-                try:
-                    os.remove(f_path)
-                    logger.info(f"Cleaned up orphan file {f_path}")
-                except:
-                    pass
+            try:
+                if now - os.path.getmtime(f_path) > 600:
+                    if os.path.isdir(f_path):
+                        shutil.rmtree(f_path, ignore_errors=True)
+                        logger.info(f"Cleaned up orphan directory {f_path}")
+                    elif os.path.isfile(f_path):
+                        os.remove(f_path)
+                        logger.info(f"Cleaned up orphan file {f_path}")
+            except Exception:
+                pass
 
 async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward liked messages to the user's Vault."""
@@ -2018,6 +2075,7 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(f"⏳ Building EPUB for {len(ch_urls)} chapters...\nThis will take a few minutes.")
 
+        epub_filename = None
         try:
             sem = asyncio.Semaphore(20)
             loop = asyncio.get_running_loop()
@@ -2087,14 +2145,17 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 track_stat(query.from_user.id, "ln_downloads")
                 await query.edit_message_text(f"✅ Light Novel sent! ({VERSION})")
 
-            if os.path.exists(epub_filename):
-                os.remove(epub_filename)
-
         except Exception as e:
             logger.error(f"Light Novel download error: {e}")
             import traceback
             logger.error(traceback.format_exc())
             await query.edit_message_text(f"❌ Error building EPUB. ({VERSION})")
+        finally:
+            if epub_filename and os.path.exists(epub_filename):
+                try:
+                    os.remove(epub_filename)
+                except Exception:
+                    pass
         return
 
 # ── MangaKatana Integration ──────────────────────────────────────────────
@@ -2254,6 +2315,8 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         manga_id, ch_suffix = cb_data.split("::")
         await query.edit_message_text("⏳ Extracting image URLs...")
 
+        cbz_dir = None
+        cbz_filename = None
         try:
             ch_url = f"https://mangakatana.com/manga/{manga_id}/{ch_suffix}"
             r = await asyncio.to_thread(
@@ -2278,9 +2341,8 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.makedirs("downloads", exist_ok=True)
             safe_title = re.sub(r'[^\w\s-]', '', manga_id)[:40].strip()
             cbz_dir = f"downloads/mg_{uuid.uuid4().hex[:8]}"
-            os.makedirs(cbz_dir, exist_ok=True)
             cbz_filename = f"downloads/{safe_title}_{ch_suffix}.cbz"
-
+            os.makedirs(cbz_dir, exist_ok=True)
             sem = asyncio.Semaphore(15)
             async def fetch_page(idx, url):
                 async with sem:
@@ -2306,9 +2368,6 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for fname in sorted(os.listdir(cbz_dir)):
                     zf.write(os.path.join(cbz_dir, fname), fname)
 
-            import shutil
-            shutil.rmtree(cbz_dir, ignore_errors=True)
-
             file_size = os.path.getsize(cbz_filename)
             caption = f"📖 <b>{manga_id} - {ch_suffix}</b>\n📄 {len(img_urls)} pages\n\n🤖 <i>{VERSION}</i>"
 
@@ -2331,14 +2390,20 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 track_stat(query.from_user.id, "manga_downloads")
                 await query.edit_message_text(f"✅ {ch_suffix} sent! ({VERSION})")
 
-            if os.path.exists(cbz_filename):
-                os.remove(cbz_filename)
-
         except Exception as e:
             logger.error(f"MangaKatana download error: {e}")
             import traceback
             logger.error(traceback.format_exc())
             await query.edit_message_text(f"❌ Error downloading chapter. ({VERSION})")
+        finally:
+            if cbz_dir:
+                import shutil
+                shutil.rmtree(cbz_dir, ignore_errors=True)
+            if cbz_filename and os.path.exists(cbz_filename):
+                try:
+                    os.remove(cbz_filename)
+                except Exception:
+                    pass
         return
 
 
