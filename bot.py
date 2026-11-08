@@ -12,13 +12,14 @@ import uuid
 import html
 from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from telegram.request import HTTPXRequest
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "v2.11.0"
+VERSION = "v2.12.0"
 
 # Enable logging
 logging.basicConfig(
@@ -780,6 +781,57 @@ def resolve_downloaded_file(filepath):
             return candidate
     return None
 
+def format_media_caption(original_url, title, files):
+    """Builds a rich, elegant caption with platform badges and file sizes."""
+    caption_parts = []
+    if title:
+        safe_title = html.escape(title[:300])
+        caption_parts.append(f"📌 <b>{safe_title}</b>")
+
+    # Detect platform
+    platform = "Web"
+    sub_or_user = ""
+    lower_url = (original_url or "").lower()
+    if 'reddit.com' in lower_url or 'redd.it' in lower_url:
+        platform = "Reddit"
+        sub_m = re.search(r'/r/([^/?&#]+)', original_url, re.IGNORECASE)
+        if sub_m:
+            sub_or_user = f"r/{sub_m.group(1)}"
+    elif 'twitter.com' in lower_url or 'x.com' in lower_url:
+        platform = "Twitter"
+        user_m = re.search(r'(?:twitter\.com|x\.com)/([^/?&#]+)/status', original_url, re.IGNORECASE)
+        if user_m and user_m.group(1).lower() not in ('i', 'status'):
+            sub_or_user = f"@{user_m.group(1)}"
+    elif 'instagram.com' in lower_url:
+        platform = "Instagram"
+    elif 'tiktok.com' in lower_url:
+        platform = "TikTok"
+    elif 'redgifs.com' in lower_url:
+        platform = "RedGifs"
+
+    escaped_href = html.escape(original_url or "", quote=True)
+    disp = original_url or ""
+    display_url = disp if len(disp) <= 65 else disp[:62] + "..."
+    escaped_display = html.escape(display_url)
+    caption_parts.append(f'🔗 <a href="{escaped_href}">{escaped_display}</a>')
+
+    meta_parts = [platform]
+    if sub_or_user:
+        meta_parts.append(sub_or_user)
+
+    if files:
+        total_size = sum(os.path.getsize(f) for f in files if isinstance(f, str) and os.path.exists(f))
+        if total_size > 0:
+            size_mb = total_size / (1024 * 1024)
+            if len(files) > 1:
+                meta_parts.append(f"{len(files)} files • {size_mb:.1f} MB")
+            else:
+                meta_parts.append(f"{size_mb:.1f} MB")
+
+    badge = " • ".join(meta_parts)
+    caption_parts.append(f"🏷️ <i>{badge}</i>")
+    return "\n".join(caption_parts)
+
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
@@ -878,6 +930,12 @@ async def send_album(message, files, as_files, caption=None):
                 
         if not valid_files:
             return
+
+        try:
+            action = ChatAction.UPLOAD_DOCUMENT if as_files else (ChatAction.UPLOAD_PHOTO if all(f.endswith(('.jpg', '.jpeg', '.png')) for f in valid_files) else ChatAction.UPLOAD_VIDEO)
+            await message.reply_chat_action(action)
+        except Exception:
+            pass
 
         if as_files:
             group = []
@@ -1019,20 +1077,35 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
     if len(urls) > 1:
         as_files = bool(re.search(r'\s-f\b', text))
         flag_suffix = " -f" if as_files else ""
-        status_msg = await message.reply_text(f"📋 Found {len(urls)} links! Processing them one by one...")
+        status_msg = await message.reply_text(f"📋 Found {len(urls)} links! Starting downloads...")
         succeeded = 0
         failed = 0
         for idx, single_url in enumerate(urls, 1):
+            try:
+                await status_msg.edit_text(
+                    f"📋 <b>Processing link {idx}/{len(urls)}</b>...\n"
+                    f"✅ {succeeded} completed  •  ❌ {failed} queued",
+                    parse_mode='HTML'
+                )
+            except Exception:
+                pass
             single_text = f"{single_url}{flag_suffix}"
             success = await process_single_link(message, single_url, single_text, user_id)
             if success:
                 succeeded += 1
             else:
                 failed += 1
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
         try:
-            await status_msg.delete()
+            if failed > 0:
+                await status_msg.edit_text(
+                    f"🏁 <b>Batch Complete</b> ({len(urls)} links):\n"
+                    f"✅ {succeeded} delivered  •  ❌ {failed} queued to /retry",
+                    parse_mode='HTML'
+                )
+            else:
+                await status_msg.delete()
         except Exception:
             pass
         return succeeded > 0
@@ -1060,6 +1133,10 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
     media_indices = sorted(list(media_indices)) if media_indices else None
 
     reply_msg = await message.reply_text("⏳ Processing link...")
+    try:
+        await message.reply_chat_action(ChatAction.RECORD_VIDEO)
+    except Exception:
+        pass
 
     # Fast zero-bandwidth passthrough for Twitter / X links
     is_twitter = ('twitter.com' in url or 'x.com' in url)
@@ -1085,24 +1162,20 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                         items = filtered
 
                 title = tw_data.get('title', '')
-                caption_parts = []
-                if title:
-                    safe_title = html.escape(title[:300])
-                    caption_parts.append(f"📌 <b>{safe_title}</b>")
-
                 tweet_link = tw_data.get("tweet_url", url)
-                escaped_tw_href = html.escape(tweet_link, quote=True)
-                escaped_tw_display = html.escape(tweet_link if len(tweet_link) <= 65 else tweet_link[:62] + "...")
-                caption_parts.append(f'🔗 <a href="{escaped_tw_href}">{escaped_tw_display}</a>')
+                caption = format_media_caption(tweet_link, title, [])
 
                 # Single photo via URL passthrough
                 if len(items) == 1 and items[0]['type'] == 'image':
                     item = items[0]
-                    caption_parts.append(f'📥 <a href="{html.escape(item["full_res"], quote=True)}">Direct Full-Res File</a>')
-                    caption = "\n\n".join(caption_parts)
                     keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❤️ Vault", callback_data="vault_this")],
                         [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
                     ])
+                    try:
+                        await message.reply_chat_action(ChatAction.UPLOAD_PHOTO)
+                    except Exception:
+                        pass
                     await message.reply_photo(
                         photo=item['url'],
                         caption=caption,
@@ -1117,14 +1190,17 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                 # Single video via URL passthrough
                 elif len(items) == 1 and items[0]['type'] in ('video', 'gif'):
                     item = items[0]
-                    caption_parts.append(f'📥 <a href="{html.escape(item["full_res"], quote=True)}">Direct Full-Res File</a>')
-                    caption = "\n\n".join(caption_parts)
                     keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❤️ Vault", callback_data="vault_this")],
                         [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
                     ])
                     v_kwargs = {'supports_streaming': True, 'read_timeout': 300, 'write_timeout': 300}
                     if item.get('width'): v_kwargs['width'] = item['width']
                     if item.get('height'): v_kwargs['height'] = item['height']
+                    try:
+                        await message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
+                    except Exception:
+                        pass
                     try:
                         if item['type'] == 'gif':
                             await message.reply_animation(
@@ -1177,6 +1253,12 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
             logger.warning(f"Zero-bandwidth Twitter extraction failed: {e}, falling back to standard downloader")
 
     try:
+        try:
+            await reply_msg.edit_text("⏳ Downloading media...")
+            await message.reply_chat_action(ChatAction.RECORD_VIDEO)
+        except Exception:
+            pass
+
         files, title, original_url = await download_media(url, media_indices, as_files=as_files)
         if not files:
             add_failed_download(user_id, url, text, "No media found")
@@ -1187,17 +1269,14 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                 pass
             return False
 
-        # Build caption
-        caption_parts = []
-        if title:
-            safe_title = html.escape(title[:300])
-            caption_parts.append(f"📌 <b>{safe_title}</b>")
-        
-        escaped_href = html.escape(original_url, quote=True)
-        display_url = original_url if len(original_url) <= 65 else original_url[:62] + "..."
-        escaped_display = html.escape(display_url)
-        caption_parts.append(f'🔗 <a href="{escaped_href}">{escaped_display}</a>')
-        caption = "\n".join(caption_parts)
+        try:
+            await reply_msg.edit_text("📤 Uploading to Telegram...")
+            action = ChatAction.UPLOAD_DOCUMENT if as_files else (ChatAction.UPLOAD_PHOTO if all(f.endswith(('.jpg', '.jpeg', '.png')) for f in files) else ChatAction.UPLOAD_VIDEO)
+            await message.reply_chat_action(action)
+        except Exception:
+            pass
+
+        caption = format_media_caption(original_url, title, files)
 
         if len(files) == 1:
             f = files[0]
@@ -1226,22 +1305,23 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
                             pass
                         return False
                         
+                vault_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❤️ Vault", callback_data="vault_this")]])
                 with open(f, 'rb') as doc:
-                        if as_files:
-                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
-                        elif ('anim_' in os.path.basename(f)) or f.lower().endswith('.gif'):
-                            w, h = get_video_dimensions(f)
-                            v_kw = {'read_timeout': 300, 'write_timeout': 300}
-                            if w: v_kw['width'] = w
-                            if h: v_kw['height'] = h
-                            await message.reply_animation(animation=doc, caption=caption, parse_mode='HTML', **v_kw)
-                        elif f.endswith(('.mp4', '.webm', '.mkv')):
-                            w, h = get_video_dimensions(f)
-                            await message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, read_timeout=300, write_timeout=300)
-                        elif f.endswith(('.jpg', '.png', '.jpeg')):
-                            await message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
-                        else:
-                            await message.reply_document(document=doc, caption=caption, parse_mode='HTML', read_timeout=300, write_timeout=300)
+                    if as_files:
+                        await message.reply_document(document=doc, caption=caption, parse_mode='HTML', reply_markup=vault_kb, read_timeout=300, write_timeout=300)
+                    elif ('anim_' in os.path.basename(f)) or f.lower().endswith('.gif'):
+                        w, h = get_video_dimensions(f)
+                        v_kw = {'read_timeout': 300, 'write_timeout': 300}
+                        if w: v_kw['width'] = w
+                        if h: v_kw['height'] = h
+                        await message.reply_animation(animation=doc, caption=caption, parse_mode='HTML', reply_markup=vault_kb, **v_kw)
+                    elif f.endswith(('.mp4', '.webm', '.mkv')):
+                        w, h = get_video_dimensions(f)
+                        await message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, reply_markup=vault_kb, read_timeout=300, write_timeout=300)
+                    elif f.endswith(('.jpg', '.png', '.jpeg')):
+                        await message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', reply_markup=vault_kb, read_timeout=300, write_timeout=300)
+                    else:
+                        await message.reply_document(document=doc, caption=caption, parse_mode='HTML', reply_markup=vault_kb, read_timeout=300, write_timeout=300)
             except Exception as e:
                 logger.error(f"Failed to send file: {e}")
                 if ("timed out" in str(e).lower() or "timeout" in str(e).lower()) and not as_files:
@@ -1793,6 +1873,40 @@ async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=user_id, 
             text="You liked a message, but you haven't set up a Vault yet! Forward any message from a private Channel here to set it as your Vault."
         )
+
+async def vault_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle one-tap ❤️ Vault inline button clicks."""
+    query = update.callback_query
+    if query.data == "vault_done":
+        await query.answer("✅ Already saved to your Vault!", show_alert=False)
+        return
+
+    user_id = query.from_user.id
+    settings = get_wishlist('settings') or {}
+    user_settings = settings.get(str(user_id), {})
+    vault_id = user_settings.get('vault_id')
+
+    if not vault_id:
+        await query.answer("❌ You haven't set up a Vault channel yet!\n\nUse /setvault or forward a post from your private channel to configure it.", show_alert=True)
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=vault_id,
+            from_chat_id=query.message.chat_id,
+            message_id=query.message.message_id
+        )
+        track_stat(user_id, "vaults")
+        await query.answer("✅ Saved to your Vault channel!")
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Vaulted", callback_data="vault_done")]])
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Vault inline button failed: {e}")
+        await query.answer("❌ Failed to forward to Vault. Make sure the bot is an Admin in your Vault channel with 'Post Messages' permission!", show_alert=True)
 
 async def setvault_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Initiates setting or changing the user's Vault channel."""
@@ -2440,6 +2554,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(manga_callback, pattern="^mg_"))
     application.add_handler(CallbackQueryHandler(ln_callback, pattern="^ln_"))
     application.add_handler(CallbackQueryHandler(redl_callback, pattern="^redl_"))
+    application.add_handler(CallbackQueryHandler(vault_callback, pattern="^vault_"))
 
     # Cleanup orphan files every 10 minutes
     application.job_queue.run_repeating(cleanup_job, interval=600, first=600)
