@@ -2748,23 +2748,6 @@ async def main():
         if not WEBHOOK_SECRET and TOKEN:
             WEBHOOK_SECRET = hashlib.sha256(TOKEN.encode()).hexdigest()
 
-        # Set Telegram Webhook to point to Render with flood-control retry
-        for attempt in range(5):
-            try:
-                await application.bot.set_webhook(
-                    url=f"{RENDER_URL}/webhook",
-                    allowed_updates=["message", "callback_query", "message_reaction"],
-                    secret_token=WEBHOOK_SECRET
-                )
-                logger.info(f"Telegram webhook set successfully to {RENDER_URL}/webhook")
-                break
-            except RetryAfter as ra:
-                logger.warning(f"Webhook flood control exceeded. Retrying after {ra.retry_after}s...")
-                await asyncio.sleep(ra.retry_after + 1)
-            except Exception as e:
-                logger.warning(f"Could not set webhook on attempt {attempt+1}: {e}")
-                await asyncio.sleep(2)
-
         async def health_check(request):
             return web.Response(text="Bot is running!")
 
@@ -2810,7 +2793,7 @@ async def main():
                     return web.Response(text=f"Error reading logs: {e}", content_type="text/plain")
             return web.Response(text="No logs yet", content_type="text/plain")
 
-        # Setup aiohttp web server
+        # Setup and start aiohttp web server FIRST so Render health checks succeed immediately
         app = web.Application()
         app.router.add_get("/", health_check)
         app.router.add_get("/logs", get_logs)
@@ -2822,8 +2805,24 @@ async def main():
         port = int(os.environ.get('PORT', 10000))
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        
         logger.info(f"Webhook server started on port {port}. Health check on /")
+
+        # Set Telegram Webhook to point to Render with flood-control retry
+        for attempt in range(5):
+            try:
+                await application.bot.set_webhook(
+                    url=f"{RENDER_URL}/webhook",
+                    allowed_updates=["message", "callback_query", "message_reaction"],
+                    secret_token=WEBHOOK_SECRET
+                )
+                logger.info(f"Telegram webhook set successfully to {RENDER_URL}/webhook")
+                break
+            except RetryAfter as ra:
+                logger.warning(f"Webhook flood control exceeded. Retrying after {ra.retry_after}s...")
+                await asyncio.sleep(ra.retry_after + 1)
+            except Exception as e:
+                logger.warning(f"Could not set webhook on attempt {attempt+1}: {e}")
+                await asyncio.sleep(2)
     else:
         await application.bot.delete_webhook(drop_pending_updates=False)
         await application.updater.start_polling(allowed_updates=["message", "callback_query", "message_reaction"])
