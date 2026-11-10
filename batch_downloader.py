@@ -170,10 +170,9 @@ async def run_batch(limit=None):
         except Exception as e:
             logger.error(f"Error processing {url}: {e}")
 
-        # Mark processed
+        # Mark processed atomically
         processed.add(url)
-        with open(progress_path, "w", encoding="utf-8") as f:
-            json.dump(list(processed), f, indent=2)
+        bot_module.atomic_json_dump(progress_path, list(processed), indent=2)
 
         # Rate limit safety delay
         await asyncio.sleep(2.0)

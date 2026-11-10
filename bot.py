@@ -10,8 +10,11 @@ import re
 import time
 import uuid
 import html
+import json
+import shutil
+import collections
 from dotenv import load_dotenv
-from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Bot, Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, MessageReactionHandler
 from telegram.request import HTTPXRequest
@@ -22,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 import hashlib
 
-VERSION = "v2.14.0"
+VERSION = "v2.15.0"
 
 # Enable logging with rotation and silenced verbose URLs
 logging.basicConfig(
@@ -38,6 +41,82 @@ scraper_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="scraper
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-skg5.onrender.com")
+
+# Admin user authorization
+raw_admins = os.getenv("ADMIN_USER_IDS", "")
+ADMIN_USER_IDS = set([int(x.strip()) for x in raw_admins.split(",") if x.strip().isdigit()])
+
+def is_admin(user_id: int) -> bool:
+    return bool(user_id and user_id in ADMIN_USER_IDS)
+
+def atomic_json_dump(filepath, data, **kwargs):
+    """Write data to a temporary file and atomically replace the destination."""
+    import tempfile
+    abs_path = os.path.abspath(filepath)
+    dir_name = os.path.dirname(abs_path)
+    os.makedirs(dir_name, exist_ok=True)
+    with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+        json.dump(data, tf, **kwargs)
+        temp_name = tf.name
+    os.replace(temp_name, abs_path)
+
+# In-memory bot message tracking for 100% safe /clean operations
+_BOT_MESSAGE_REGISTRY = collections.defaultdict(set)
+
+def track_bot_message(chat_id: int, message_id: int):
+    """Tracks message IDs sent by the bot to ensure /clean never touches user messages."""
+    if not chat_id or not message_id:
+        return
+    try:
+        msg_set = _BOT_MESSAGE_REGISTRY[chat_id]
+        msg_set.add(message_id)
+        if len(msg_set) > 1000:
+            _BOT_MESSAGE_REGISTRY[chat_id] = set(sorted(msg_set)[-1000:])
+    except Exception:
+        pass
+
+def get_tracked_bot_messages(chat_id: int):
+    return set(_BOT_MESSAGE_REGISTRY.get(chat_id, set()))
+
+def clear_tracked_bot_messages(chat_id: int):
+    if chat_id in _BOT_MESSAGE_REGISTRY:
+        _BOT_MESSAGE_REGISTRY[chat_id].clear()
+
+def _install_bot_message_tracker():
+    """Wrap telegram.Bot send methods so every message sent by the bot is automatically tracked."""
+    methods = [
+        "send_message", "send_photo", "send_video", "send_document",
+        "send_animation", "send_audio", "send_voice", "send_media_group"
+    ]
+    for method_name in methods:
+        orig = getattr(Bot, method_name, None)
+        if not orig or getattr(orig, "_is_tracked", False):
+            continue
+        def _make_wrapper(original_method):
+            async def wrapper(self, *args, **kwargs):
+                result = await original_method(self, *args, **kwargs)
+                try:
+                    if isinstance(result, (list, tuple)):
+                        for m in result:
+                            cid = getattr(m, 'chat_id', None) or (m.chat.id if getattr(m, 'chat', None) else None)
+                            mid = getattr(m, 'message_id', None)
+                            if cid and mid:
+                                track_bot_message(cid, mid)
+                    else:
+                        cid = getattr(result, 'chat_id', None) or (result.chat.id if getattr(result, 'chat', None) else None)
+                        mid = getattr(result, 'message_id', None)
+                        if cid and mid:
+                            track_bot_message(cid, mid)
+                except Exception:
+                    pass
+                return result
+            wrapper._is_tracked = True
+            return wrapper
+        setattr(Bot, method_name, _make_wrapper(orig))
+
+_install_bot_message_tracker()
+
+GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
 
 def _ensure_cookies():
     ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
@@ -152,12 +231,13 @@ def save_wishlist(user_id, wishlist):
         else:
             data = {}
             if os.path.exists('wishlist.json'):
-                with open('wishlist.json', 'r') as f:
-                    data = json.load(f)
+                try:
+                    with open('wishlist.json', 'r') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
             data[str(user_id)] = wishlist
-            # ponytail: wishlist.json has no file locking, if throughput matters switch to sqlite
-            with open('wishlist.json', 'w') as f:
-                json.dump(data, f)
+            atomic_json_dump('wishlist.json', data)
     except Exception as e:
         logger.error(f"Error saving wishlist: {e}")
 
@@ -197,11 +277,13 @@ def add_failed_download(user_id, url, raw_text, reason=None):
         else:
             data = {}
             if os.path.exists('retry_queue.json'):
-                with open('retry_queue.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                try:
+                    with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
             data[str(user_id)] = items
-            with open('retry_queue.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
+            atomic_json_dump('retry_queue.json', data, indent=2)
         logger.info(f"Added {url} to retry queue for user {user_id}")
     except Exception as e:
         logger.error(f"Error adding to retry queue: {e}")
@@ -221,11 +303,13 @@ def remove_failed_download(user_id, url):
         else:
             data = {}
             if os.path.exists('retry_queue.json'):
-                with open('retry_queue.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                try:
+                    with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
             data[str(user_id)] = new_items
-            with open('retry_queue.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
+            atomic_json_dump('retry_queue.json', data, indent=2)
         logger.info(f"Removed {url} from retry queue for user {user_id}")
     except Exception as e:
         logger.error(f"Error removing from retry queue: {e}")
@@ -236,11 +320,13 @@ def clear_failed_queue(user_id):
             retry_col.delete_one({"_id": str(user_id)})
         else:
             if os.path.exists('retry_queue.json'):
-                with open('retry_queue.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                try:
+                    with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
                 data.pop(str(user_id), None)
-                with open('retry_queue.json', 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2)
+                atomic_json_dump('retry_queue.json', data, indent=2)
     except Exception as e:
         logger.error(f"Error clearing retry queue: {e}")
 
@@ -286,8 +372,7 @@ def record_download_history(user_id, url, status, title=None, error=None, messag
                 sorted_keys = sorted(user_hist.keys(), key=lambda k: user_hist[k].get('timestamp', ''), reverse=True)[:300]
                 user_hist = {k: user_hist[k] for k in sorted_keys}
             history[str(user_id)] = user_hist
-            with open('download_history.json', 'w', encoding='utf-8') as f:
-                json.dump(history, f, indent=2)
+            atomic_json_dump('download_history.json', history, indent=2)
     except Exception as e:
         logger.error(f"Error recording download history: {e}")
 
@@ -693,7 +778,12 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                 target_url = extracted_url
             if extracted_title:
                 title = extracted_title
-        elif 'tiktok.com' in url:
+        # Isolated per-request download directory to prevent concurrent file collisions
+        req_id = uuid.uuid4().hex[:8]
+        req_dir = os.path.join('downloads', req_id)
+        os.makedirs(req_dir, exist_ok=True)
+
+        if 'tiktok.com' in url:
             try:
                 # Use tikwm API to get 100% watermark-free raw video
                 res = requests.get(f"https://www.tikwm.com/api/?url={url}", timeout=10)
@@ -703,10 +793,9 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                         play_url = data['data']['play']
                         title = data['data'].get('title', '')
                         
-                        os.makedirs('downloads', exist_ok=True)
                         m_res = requests.get(play_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
                         if m_res.status_code == 200:
-                            filename = f"downloads/tiktok_{uuid.uuid4().hex}.mp4"
+                            filename = f"{req_dir}/tiktok_{uuid.uuid4().hex}.mp4"
                             with open(filename, 'wb') as f:
                                 f.write(m_res.content)
                             return [filename]
@@ -722,11 +811,13 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
         )
 
         ydl_opts = {
-            'outtmpl': 'downloads/%(extractor)s_%(id)s.%(ext)s',
+            'outtmpl': f'{req_dir}/%(extractor)s_%(id)s.%(ext)s',
             'format': format_selector,
             'merge_output_format': 'mp4',
             'postprocessor_args': {'merger': ['-c', 'copy']},
             'noplaylist': False,
+            'playlistend': 10,
+            'max_filesize': 100 * 1024 * 1024,
             'quiet': True,
             'no_warnings': True,
             'socket_timeout': 30,
@@ -735,7 +826,7 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
         }
         
         if media_indices:
-            ydl_opts['playlist_items'] = ','.join(str(idx) for idx in media_indices)
+            ydl_opts['playlist_items'] = ','.join(str(idx) for idx in media_indices[:10])
             
         # Add Instagram cookie if available
         if ('instagram.com' in url or 'ig.me' in url) and os.path.exists('ig_cookies.txt'):
@@ -765,15 +856,16 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                 return fallback_files
             raise e
 
-    files = await asyncio.to_thread(_download)
-    if not as_files and files:
-        def _batch_convert(file_list):
-            has_gifs = any(f.lower().endswith('.gif') for f in file_list)
-            if not has_gifs:
-                return file_list
-            with ThreadPoolExecutor(max_workers=min(3, len(file_list))) as executor:
-                return list(executor.map(convert_gif_to_mp4, file_list))
-        files = await asyncio.to_thread(_batch_convert, files)
+    async with GLOBAL_DOWNLOAD_SEMAPHORE:
+        files = await asyncio.to_thread(_download)
+        if not as_files and files:
+            def _batch_convert(file_list):
+                has_gifs = any(f.lower().endswith('.gif') for f in file_list)
+                if not has_gifs:
+                    return file_list
+                with ThreadPoolExecutor(max_workers=min(3, len(file_list))) as executor:
+                    return list(executor.map(convert_gif_to_mp4, file_list))
+            files = await asyncio.to_thread(_batch_convert, files)
 
     if files:
         resolved = []
@@ -1376,7 +1468,16 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                 return False
             finally:
                 if os.path.exists(f):
-                    os.remove(f)
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+                parent = os.path.dirname(f)
+                if parent and os.path.basename(parent) != 'downloads' and 'downloads' in parent:
+                    try:
+                        shutil.rmtree(parent, ignore_errors=True)
+                    except Exception:
+                        pass
             await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
             return True
         else:
@@ -1396,7 +1497,17 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
             finally:
                 for f in files:
                     if os.path.exists(f):
-                        os.remove(f)
+                        try:
+                            os.remove(f)
+                        except Exception:
+                            pass
+                if files:
+                    parent = os.path.dirname(files[0])
+                    if parent and os.path.basename(parent) != 'downloads' and 'downloads' in parent:
+                        try:
+                            shutil.rmtree(parent, ignore_errors=True)
+                        except Exception:
+                            pass
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download failed: {e}")
         error_msg = e.message if hasattr(e, 'message') else str(e)
@@ -1591,26 +1702,31 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text(summary, parse_mode="HTML")
 
 async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Deletes all messages sent by the bot in the chat while keeping user's link messages intact."""
+    """Deletes only verified messages sent by the bot while keeping user's link messages intact."""
     message = update.message
     if not message:
         return
-    user_id = message.from_user.id
-    current_msg_id = message.message_id
+    chat_id = message.chat_id
     bot = context.bot
+
+    bot_msg_ids = get_tracked_bot_messages(chat_id)
+    if not bot_msg_ids:
+        await message.reply_text("🧹 No bot messages tracked in this session to clean up. Your links are safe.")
+        return
 
     status_msg = await message.reply_text("🧹 Cleaning up bot messages... Your links will remain untouched.")
 
     deleted_count = 0
-    # Sweep backwards through up to 300 recent message IDs
-    for msg_id in range(current_msg_id - 1, max(0, current_msg_id - 300), -1):
+    # Delete ONLY tracked bot message IDs to guarantee user messages are never touched
+    for msg_id in sorted(list(bot_msg_ids), reverse=True):
         try:
-            await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
             deleted_count += 1
             await asyncio.sleep(0.04)
         except Exception:
             pass
 
+    clear_tracked_bot_messages(chat_id)
     await status_msg.edit_text(f"✅ Cleaned up {deleted_count} bot responses! Your original links are preserved.")
     await asyncio.sleep(4)
     try:
@@ -1620,13 +1736,24 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def adminmisuse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    admin_pass = os.getenv("ADMIN_PASSCODE")
     args = context.args
-    if args and args[0] == "69420":
-        context.user_data['awaiting_pfp'] = True
-        await update.message.reply_text("Admin mode unlocked. Send me a photo to use as my new profile picture.")
+    authorized = is_admin(user_id) or (admin_pass and args and args[0] == admin_pass)
+    if not authorized:
+        await update.message.reply_text("⛔ Unauthorized: Admin access required.")
+        return
+    context.user_data['awaiting_pfp'] = True
+    context.user_data['admin_unlocked'] = True
+    await update.message.reply_text("Admin mode unlocked. Send me a photo to use as my new profile picture.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
     if context.user_data.get('awaiting_pfp'):
+        if not context.user_data.get('admin_unlocked') and not is_admin(user_id):
+            context.user_data.pop('awaiting_pfp', None)
+            context.user_data.pop('admin_unlocked', None)
+            return
         photo = update.message.photo[-1]
         file = await photo.get_file()
         os.makedirs('downloads', exist_ok=True)
@@ -1658,6 +1785,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if os.path.exists(photo_path):
                 os.remove(photo_path)
             context.user_data['awaiting_pfp'] = False
+            context.user_data.pop('admin_unlocked', None)
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -2056,8 +2184,10 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    # Ensure this is somewhat protected (optional, maybe check against an admin ID if you have one)
+    user_id = update.message.from_user.id if update.message and update.message.from_user else None
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Unauthorized: Admin access required.")
+        return
     if os.path.exists('bot.log'):
         with open('bot.log', 'r', encoding='utf-8') as f:
             from collections import deque
@@ -2638,6 +2768,16 @@ async def main():
         async def health_check(request):
             return web.Response(text="Bot is running!")
 
+        _webhook_tasks = set()
+        _webhook_semaphore = asyncio.Semaphore(10)
+
+        async def _safe_process_update(up):
+            async with _webhook_semaphore:
+                try:
+                    await application.process_update(up)
+                except Exception as exc:
+                    logger.error(f"Unhandled error in webhook update processing: {exc}", exc_info=True)
+
         async def telegram_webhook(request):
             if WEBHOOK_SECRET:
                 req_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
@@ -2646,13 +2786,19 @@ async def main():
             try:
                 data = await request.json()
                 update = Update.de_json(data, application.bot)
-                asyncio.create_task(application.process_update(update))
+                task = asyncio.create_task(_safe_process_update(update))
+                _webhook_tasks.add(task)
+                task.add_done_callback(_webhook_tasks.discard)
                 return web.Response(text="OK")
             except Exception as e:
                 logger.error(f"Error handling webhook: {e}")
                 return web.Response(status=500)
 
         async def get_logs(request):
+            auth_token = request.headers.get("X-Admin-Token") or request.query.get("token")
+            expected = os.getenv("ADMIN_LOGS_TOKEN") or WEBHOOK_SECRET
+            if not auth_token or auth_token != expected:
+                return web.Response(status=403, text="Forbidden: Admin authentication required")
             if os.path.exists("bot.log"):
                 try:
                     size = os.path.getsize("bot.log")
@@ -2689,6 +2835,8 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
+        if is_render and _webhook_tasks:
+            await asyncio.gather(*_webhook_tasks, return_exceptions=True)
         if not is_render and application.updater and application.updater.running:
             await application.updater.stop()
         await application.stop()
