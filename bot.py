@@ -182,7 +182,7 @@ _ensure_cookies()
 
 import json
 
-MONGO_URI = os.environ.get('MONGO_URI')
+MONGO_URI = os.environ.get('MONGODB_URI') or os.environ.get('MONGO_URI')
 if MONGO_URI:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client['media_downloader']
