@@ -31,4 +31,6 @@ check_*.py
 deploy_*.py
 telethon_auth.json
 batch_progress.json
+batch_failed.json
 extracted_links.json
+*.lock

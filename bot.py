@@ -13,6 +13,8 @@ import html
 import json
 import shutil
 import collections
+import threading
+import contextlib
 from dotenv import load_dotenv
 from telegram import Bot, Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction
@@ -25,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 import hashlib
 
-VERSION = "v2.15.0"
+VERSION = "v2.16.0"
 
 # Enable logging with rotation and silenced verbose URLs
 logging.basicConfig(
@@ -59,6 +61,39 @@ def atomic_json_dump(filepath, data, **kwargs):
         json.dump(data, tf, **kwargs)
         temp_name = tf.name
     os.replace(temp_name, abs_path)
+
+# Synchronization locks for thread-safe and cross-process safe persistence
+_WISHLIST_LOCK = threading.Lock()
+_RETRY_QUEUE_LOCK = threading.Lock()
+_HISTORY_LOCK = threading.Lock()
+
+@contextlib.contextmanager
+def file_lock(lock_path):
+    """Cross-platform standard library file lock to eliminate lost updates in local JSON persistence."""
+    lock_file = f"{lock_path}.lock"
+    f = open(lock_file, "w")
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
 
 # In-memory bot message tracking for 100% safe /clean operations
 _BOT_MESSAGE_REGISTRY = collections.defaultdict(set)
@@ -211,11 +246,12 @@ def get_wishlist(user_id):
             doc = wishlist_col.find_one({"_id": str(user_id)})
             return doc.get('data', []) if doc else []
         else:
-            if os.path.exists('wishlist.json'):
-                with open('wishlist.json', 'r') as f:
-                    data = json.load(f)
-                    return data.get(str(user_id), [])
-            return []
+            with file_lock('wishlist.json'), _WISHLIST_LOCK:
+                if os.path.exists('wishlist.json'):
+                    with open('wishlist.json', 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        return data.get(str(user_id), [])
+                return []
     except Exception as e:
         logger.error(f"Error getting wishlist: {e}")
         return None
@@ -229,17 +265,69 @@ def save_wishlist(user_id, wishlist):
                 upsert=True
             )
         else:
-            data = {}
-            if os.path.exists('wishlist.json'):
-                try:
-                    with open('wishlist.json', 'r') as f:
-                        data = json.load(f)
-                except Exception:
-                    data = {}
-            data[str(user_id)] = wishlist
-            atomic_json_dump('wishlist.json', data)
+            with file_lock('wishlist.json'), _WISHLIST_LOCK:
+                data = {}
+                if os.path.exists('wishlist.json'):
+                    try:
+                        with open('wishlist.json', 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                    except Exception as err:
+                        logger.error(f"Error reading wishlist.json before write: {err}")
+                        return
+                data[str(user_id)] = wishlist
+                atomic_json_dump('wishlist.json', data)
     except Exception as e:
         logger.error(f"Error saving wishlist: {e}")
+
+def get_user_vault(user_id):
+    """Safely retrieves vault_id for user_id. Returns (vault_id, is_error)."""
+    try:
+        if mongo_client:
+            doc = wishlist_col.find_one({"_id": "settings"}, {f"data.{user_id}": 1})
+            if doc and "data" in doc and str(user_id) in doc["data"]:
+                return doc["data"][str(user_id)].get("vault_id"), False
+            return None, False
+        else:
+            with file_lock('wishlist.json'), _WISHLIST_LOCK:
+                if os.path.exists('wishlist.json'):
+                    with open('wishlist.json', 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    settings = data.get('settings', {})
+                    return settings.get(str(user_id), {}).get('vault_id'), False
+                return None, False
+    except Exception as e:
+        logger.error(f"Error reading vault settings for {user_id}: {e}")
+        return None, True
+
+def set_user_vault(user_id, vault_id):
+    """Safely sets vault_id for user_id without risking overwriting other users' settings."""
+    try:
+        if mongo_client:
+            # User-scoped atomic field update in MongoDB - cannot overwrite other users' settings
+            wishlist_col.update_one(
+                {"_id": "settings"},
+                {"$set": {f"data.{user_id}.vault_id": vault_id}},
+                upsert=True
+            )
+            return True
+        else:
+            with file_lock('wishlist.json'), _WISHLIST_LOCK:
+                data = {}
+                if os.path.exists('wishlist.json'):
+                    try:
+                        with open('wishlist.json', 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                    except Exception as err:
+                        logger.error(f"Failed to read wishlist.json before saving vault: {err}")
+                        return False
+                settings = data.setdefault('settings', {})
+                user_conf = settings.setdefault(str(user_id), {})
+                user_conf['vault_id'] = vault_id
+                atomic_json_dump('wishlist.json', data)
+                return True
+    except Exception as e:
+        logger.error(f"Error saving user vault for {user_id}: {e}")
+        return False
 
 def get_failed_queue(user_id):
     try:
@@ -247,10 +335,11 @@ def get_failed_queue(user_id):
             doc = retry_col.find_one({"_id": str(user_id)})
             return doc.get('items', []) if doc else []
         else:
-            if os.path.exists('retry_queue.json'):
-                with open('retry_queue.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data.get(str(user_id), [])
+            with file_lock('retry_queue.json'), _RETRY_QUEUE_LOCK:
+                if os.path.exists('retry_queue.json'):
+                    with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        return data.get(str(user_id), [])
     except Exception as e:
         logger.error(f"Error getting retry queue: {e}")
     return []
@@ -258,58 +347,69 @@ def get_failed_queue(user_id):
 def add_failed_download(user_id, url, raw_text, reason=None):
     from datetime import datetime, timezone
     try:
-        items = get_failed_queue(user_id)
-        # Avoid duplicate URLs, move latest attempt to top
-        items = [i for i in items if i.get('url') != url]
-        items.insert(0, {
+        new_entry = {
             "url": url,
             "raw_text": raw_text,
             "reason": str(reason)[:200] if reason else "Download failed",
             "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        })
-        items = items[:50]
+        }
         if mongo_client and retry_col is not None:
+            items = get_failed_queue(user_id)
+            items = [i for i in items if i.get('url') != url]
+            items.insert(0, new_entry)
+            items = items[:50]
             retry_col.update_one(
                 {"_id": str(user_id)},
                 {"$set": {"items": items}},
                 upsert=True
             )
         else:
-            data = {}
-            if os.path.exists('retry_queue.json'):
-                try:
-                    with open('retry_queue.json', 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                except Exception:
-                    data = {}
-            data[str(user_id)] = items
-            atomic_json_dump('retry_queue.json', data, indent=2)
+            with file_lock('retry_queue.json'), _RETRY_QUEUE_LOCK:
+                data = {}
+                if os.path.exists('retry_queue.json'):
+                    try:
+                        with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                    except Exception as err:
+                        logger.error(f"Error reading retry_queue.json before write: {err}")
+                        return
+                user_items = data.get(str(user_id), [])
+                user_items = [i for i in user_items if i.get('url') != url]
+                user_items.insert(0, new_entry)
+                data[str(user_id)] = user_items[:50]
+                atomic_json_dump('retry_queue.json', data, indent=2)
         logger.info(f"Added {url} to retry queue for user {user_id}")
     except Exception as e:
         logger.error(f"Error adding to retry queue: {e}")
 
 def remove_failed_download(user_id, url):
     try:
-        items = get_failed_queue(user_id)
-        new_items = [i for i in items if i.get('url') != url]
-        if len(new_items) == len(items):
-            return
         if mongo_client and retry_col is not None:
+            items = get_failed_queue(user_id)
+            new_items = [i for i in items if i.get('url') != url]
+            if len(new_items) == len(items):
+                return
             retry_col.update_one(
                 {"_id": str(user_id)},
                 {"$set": {"items": new_items}},
                 upsert=True
             )
         else:
-            data = {}
-            if os.path.exists('retry_queue.json'):
-                try:
-                    with open('retry_queue.json', 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                except Exception:
-                    data = {}
-            data[str(user_id)] = new_items
-            atomic_json_dump('retry_queue.json', data, indent=2)
+            with file_lock('retry_queue.json'), _RETRY_QUEUE_LOCK:
+                data = {}
+                if os.path.exists('retry_queue.json'):
+                    try:
+                        with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                    except Exception as err:
+                        logger.error(f"Error reading retry_queue.json before write: {err}")
+                        return
+                user_items = data.get(str(user_id), [])
+                new_items = [i for i in user_items if i.get('url') != url]
+                if len(new_items) == len(user_items):
+                    return
+                data[str(user_id)] = new_items
+                atomic_json_dump('retry_queue.json', data, indent=2)
         logger.info(f"Removed {url} from retry queue for user {user_id}")
     except Exception as e:
         logger.error(f"Error removing from retry queue: {e}")
@@ -319,14 +419,17 @@ def clear_failed_queue(user_id):
         if mongo_client and retry_col is not None:
             retry_col.delete_one({"_id": str(user_id)})
         else:
-            if os.path.exists('retry_queue.json'):
-                try:
-                    with open('retry_queue.json', 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                except Exception:
-                    data = {}
-                data.pop(str(user_id), None)
-                atomic_json_dump('retry_queue.json', data, indent=2)
+            with file_lock('retry_queue.json'), _RETRY_QUEUE_LOCK:
+                if os.path.exists('retry_queue.json'):
+                    try:
+                        with open('retry_queue.json', 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                    except Exception as err:
+                        logger.error(f"Error reading retry_queue.json before write: {err}")
+                        return
+                    if str(user_id) in data:
+                        data.pop(str(user_id), None)
+                        atomic_json_dump('retry_queue.json', data, indent=2)
     except Exception as e:
         logger.error(f"Error clearing retry queue: {e}")
 
@@ -359,20 +462,22 @@ def record_download_history(user_id, url, status, title=None, error=None, messag
                 upsert=True
             )
         else:
-            history = {}
-            if os.path.exists('download_history.json'):
-                try:
-                    with open('download_history.json', 'r', encoding='utf-8') as f:
-                        history = json.load(f)
-                except Exception:
-                    history = {}
-            user_hist = history.get(str(user_id), {})
-            user_hist[norm_key] = record
-            if len(user_hist) > 300:
-                sorted_keys = sorted(user_hist.keys(), key=lambda k: user_hist[k].get('timestamp', ''), reverse=True)[:300]
-                user_hist = {k: user_hist[k] for k in sorted_keys}
-            history[str(user_id)] = user_hist
-            atomic_json_dump('download_history.json', history, indent=2)
+            with file_lock('download_history.json'), _HISTORY_LOCK:
+                history = {}
+                if os.path.exists('download_history.json'):
+                    try:
+                        with open('download_history.json', 'r', encoding='utf-8') as f:
+                            history = json.load(f)
+                    except Exception as err:
+                        logger.error(f"Error reading download_history.json before write: {err}")
+                        return
+                user_hist = history.get(str(user_id), {})
+                user_hist[norm_key] = record
+                if len(user_hist) > 300:
+                    sorted_keys = sorted(user_hist.keys(), key=lambda k: user_hist[k].get('timestamp', ''), reverse=True)[:300]
+                    user_hist = {k: user_hist[k] for k in sorted_keys}
+                history[str(user_id)] = user_hist
+                atomic_json_dump('download_history.json', history, indent=2)
     except Exception as e:
         logger.error(f"Error recording download history: {e}")
 
@@ -386,9 +491,10 @@ def get_download_history_item(user_id, url):
             }, {"_id": 0, "status": 1, "title": 1, "time_display": 1, "error": 1})
             return doc
         else:
-            if os.path.exists('download_history.json'):
-                with open('download_history.json', 'r', encoding='utf-8') as f:
-                    history = json.load(f)
+            with file_lock('download_history.json'), _HISTORY_LOCK:
+                if os.path.exists('download_history.json'):
+                    with open('download_history.json', 'r', encoding='utf-8') as f:
+                        history = json.load(f)
                     user_hist = history.get(str(user_id), {})
                     if norm_key in user_hist:
                         return user_hist[norm_key]
@@ -1625,7 +1731,6 @@ async def handle_replied_link(message, reply_to, url: str, user_text: str, user_
 
 async def redl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Fetching media...")
     data = query.data
     parts = data.split('_', 2)
     mode = parts[1] if len(parts) > 1 else 'std'
@@ -1633,13 +1738,19 @@ async def redl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     url_info = redl_cache.get(token)
     if not url_info:
-        await query.message.reply_text("⚠️ This download session expired. Please reply to the link again.")
+        await query.answer("⚠️ This download session expired. Please reply to the link again.", show_alert=True)
         return
         
+    user_id = query.from_user.id
+    owner_id = url_info.get('user_id')
+    if owner_id and user_id != owner_id:
+        await query.answer("⛔ This redownload button was generated for another user.", show_alert=True)
+        return
+
+    await query.answer("Fetching media...")
     url = url_info.get('url')
     as_files = (mode == 'doc')
     req_text = f"{url} -f" if as_files else url
-    user_id = query.from_user.id
     
     await process_media_request(query.message, req_text, user_id)
 
@@ -2024,9 +2135,7 @@ async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = reaction.user
     user_id = user.id if user else reaction.chat.id
-    settings = get_wishlist('settings') or {}
-    user_settings = settings.get(str(user_id), {})
-    vault_id = user_settings.get('vault_id')
+    vault_id, is_error = get_user_vault(user_id)
 
     if vault_id:
         try:
@@ -2056,9 +2165,10 @@ async def vault_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = query.from_user.id
-    settings = get_wishlist('settings') or {}
-    user_settings = settings.get(str(user_id), {})
-    vault_id = user_settings.get('vault_id')
+    vault_id, is_error = get_user_vault(user_id)
+    if is_error:
+        await query.answer("❌ Database temporarily unavailable. Please try again in a moment.", show_alert=True)
+        return
 
     if not vault_id:
         await query.answer("❌ You haven't set up a Vault channel yet!\n\nUse /setvault or forward a post from your private channel to configure it.", show_alert=True)
@@ -2099,9 +2209,7 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = message.from_user.id
-    settings = get_wishlist('settings') or {}
-    user_settings = settings.get(str(user_id), {})
-    vault_id = user_settings.get('vault_id')
+    vault_id, is_error = get_user_vault(user_id)
 
     origin = message.forward_origin
     text = (message.text or message.caption or "").strip()
@@ -2115,10 +2223,10 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_vault_setup and origin and origin.type in ['channel', 'chat'] and hasattr(origin, 'chat'):
         chat_id = origin.chat.id
-        if str(user_id) not in settings:
-            settings[str(user_id)] = {}
-        settings[str(user_id)]['vault_id'] = chat_id
-        save_wishlist('settings', settings)
+        saved = set_user_vault(user_id, chat_id)
+        if not saved:
+            await message.reply_text("❌ Database temporarily unavailable. Failed to save Vault settings.")
+            return
         context.user_data.pop('awaiting_vault_setup', None)
         chat_title = getattr(origin.chat, 'title', 'Channel')
         await message.reply_text(
@@ -2753,6 +2861,7 @@ async def main():
 
         _webhook_tasks = set()
         _webhook_semaphore = asyncio.Semaphore(10)
+        MAX_PENDING_WEBHOOK_TASKS = 25
 
         async def _safe_process_update(up):
             async with _webhook_semaphore:
@@ -2766,6 +2875,12 @@ async def main():
                 req_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
                 if req_secret != WEBHOOK_SECRET:
                     return web.Response(status=403, text="Forbidden")
+
+            # Bounded queue ingress: Throttle sustained bursts to prevent memory exhaustion
+            if len(_webhook_tasks) >= MAX_PENDING_WEBHOOK_TASKS:
+                logger.warning(f"Webhook backlog full ({len(_webhook_tasks)} tasks). Returning 429 for Telegram backoff retry.")
+                return web.Response(status=429, text="Too Many Requests - Worker Backlog Saturated")
+
             try:
                 data = await request.json()
                 update = Update.de_json(data, application.bot)

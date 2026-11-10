@@ -163,16 +163,36 @@ async def run_batch(limit=None):
         count += 1
         logger.info(f"[{idx}/{total}] Processing: {url} (msg_id: {msg_id})")
 
-        proxy = MessageProxy(bot, USER_ID, msg_id)
+        failed_path = os.path.join(os.path.dirname(__file__), "batch_failed.json")
+        failed_links = {}
+        if os.path.exists(failed_path):
+            try:
+                with open(failed_path, "r", encoding="utf-8") as f:
+                    failed_links = json.load(f)
+            except Exception:
+                failed_links = {}
+
+        success = False
         try:
             success = await bot_module.process_single_link(proxy, url, text, USER_ID)
             logger.info(f"Result for {url}: {'SUCCESS' if success else 'FAILED'}")
         except Exception as e:
             logger.error(f"Error processing {url}: {e}")
+            failed_links[url] = {"error": str(e), "msg_id": msg_id}
 
-        # Mark processed atomically
-        processed.add(url)
-        bot_module.atomic_json_dump(progress_path, list(processed), indent=2)
+        if success:
+            # Mark processed atomically and remove from failure registry if previously failed
+            processed.add(url)
+            bot_module.atomic_json_dump(progress_path, list(processed), indent=2)
+            if url in failed_links:
+                failed_links.pop(url, None)
+                bot_module.atomic_json_dump(failed_path, failed_links, indent=2)
+        else:
+            # Do NOT mark as processed so future runs will retry it
+            logger.warning(f"Skipping marking {url} as processed due to failure so it can be retried on next run.")
+            if url not in failed_links:
+                failed_links[url] = {"error": "Download or dispatch failed", "msg_id": msg_id}
+            bot_module.atomic_json_dump(failed_path, failed_links, indent=2)
 
         # Rate limit safety delay
         await asyncio.sleep(2.0)
