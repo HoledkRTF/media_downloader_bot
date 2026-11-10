@@ -19,15 +19,21 @@ from telegram.error import RetryAfter, TelegramError
 from pymongo import MongoClient
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import RotatingFileHandler
+import hashlib
 
-VERSION = "v2.13.0"
+VERSION = "v2.14.0"
 
-# Enable logging
+# Enable logging with rotation and silenced verbose URLs
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO,
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
+    handlers=[RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8"), logging.StreamHandler()]
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# Dedicated bounded executor for heavy scraping jobs to prevent starving media downloads
+scraper_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="scraper_worker")
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -130,9 +136,10 @@ def get_wishlist(user_id):
                 with open('wishlist.json', 'r') as f:
                     data = json.load(f)
                     return data.get(str(user_id), [])
+            return []
     except Exception as e:
         logger.error(f"Error getting wishlist: {e}")
-    return []
+        return None
 
 def save_wishlist(user_id, wishlist):
     try:
@@ -722,6 +729,9 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
             'noplaylist': False,
             'quiet': True,
             'no_warnings': True,
+            'socket_timeout': 30,
+            'retries': 3,
+            'fragment_retries': 3,
         }
         
         if media_indices:
@@ -915,7 +925,9 @@ async def send_album(message, files, as_files, caption=None):
     try:
         if not as_files and files and any(f.lower().endswith('.gif') for f in files):
             with ThreadPoolExecutor(max_workers=min(3, len(files))) as ex:
-                files = list(ex.map(convert_gif_to_mp4, files))
+                converted = list(ex.map(convert_gif_to_mp4, files))
+                files.clear()
+                files.extend(converted)
         # Check files for size limit. Any file > 50MB gets sent to Gofile instead.
         large_files = []
         valid_files = []
@@ -931,7 +943,7 @@ async def send_album(message, files, as_files, caption=None):
         # If there are large files, upload them to Gofile and notify the user
         for lf in large_files:
             await message.reply_text("⏳ A file in this album is over 50MB! Uploading the uncompressed original to Gofile...")
-            cloud_link = upload_to_gofile(lf)
+            cloud_link = await asyncio.to_thread(upload_to_gofile, lf)
             if cloud_link:
                 await message.reply_text(f"✅ One of the files was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True)
             else:
@@ -1126,7 +1138,7 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
     flight_id = (user_id, norm_key)
     if flight_id in inflight_downloads:
         await message.reply_text("⏳ This media item is already currently being downloaded. Please hold on!")
-        return True
+        return False
 
     inflight_downloads.add(flight_id)
     try:
@@ -1252,7 +1264,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                         media_group = []
                         for idx, m in enumerate(items):
                             if idx == 0:
-                                cap = "\n\n".join(caption_parts)
+                                cap = caption
                                 media_group.append(InputMediaPhoto(media=m['url'], caption=cap, parse_mode='HTML'))
                             else:
                                 media_group.append(InputMediaPhoto(media=m['url']))
@@ -1313,7 +1325,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
             try:
                 if os.path.getsize(f) > 50 * 1024 * 1024:
                     await reply_msg.edit_text("⏳ File is over 50MB! Uploading the uncompressed original to Gofile...")
-                    cloud_link = upload_to_gofile(f)
+                    cloud_link = await asyncio.to_thread(upload_to_gofile, f)
                     if cloud_link:
                         await message.reply_text(f"{caption}\n\n✅ File was too large for Telegram, so I uploaded it here:\n\n🔗 {cloud_link}", disable_web_page_preview=True, parse_mode='HTML')
                         await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
@@ -1332,13 +1344,13 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                     if as_files:
                         await message.reply_document(document=doc, caption=caption, parse_mode='HTML', reply_markup=vault_kb, read_timeout=300, write_timeout=300)
                     elif ('anim_' in os.path.basename(f)) or f.lower().endswith('.gif'):
-                        w, h = get_video_dimensions(f)
+                        w, h = await asyncio.to_thread(get_video_dimensions, f)
                         v_kw = {'read_timeout': 300, 'write_timeout': 300}
                         if w: v_kw['width'] = w
                         if h: v_kw['height'] = h
                         await message.reply_animation(animation=doc, caption=caption, parse_mode='HTML', reply_markup=vault_kb, **v_kw)
                     elif f.endswith(('.mp4', '.webm', '.mkv')):
-                        w, h = get_video_dimensions(f)
+                        w, h = await asyncio.to_thread(get_video_dimensions, f)
                         await message.reply_video(video=doc, caption=caption, parse_mode='HTML', width=w, height=h, supports_streaming=True, reply_markup=vault_kb, read_timeout=300, write_timeout=300)
                     elif f.endswith(('.jpg', '.png', '.jpeg')):
                         await message.reply_photo(photo=doc, caption=caption, parse_mode='HTML', reply_markup=vault_kb, read_timeout=300, write_timeout=300)
@@ -1694,6 +1706,9 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     wishlist = get_wishlist(user_id)
+    if wishlist is None:
+        await query.edit_message_text("❌ Database is currently unavailable. Please try again.")
+        return
     
     if data.startswith("wh_page_"):
         page = int(data.split("_")[2])
@@ -1736,12 +1751,18 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if img_res.status_code == 200:
             os.makedirs('downloads', exist_ok=True)
             cover_path = f"downloads/wh_{code}.jpg"
-            with open(cover_path, 'wb') as f:
-                f.write(img_res.content)
-            with open(cover_path, 'rb') as f:
-                await query.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard)
-            os.remove(cover_path)
-            await query.message.delete()
+            try:
+                with open(cover_path, 'wb') as f:
+                    f.write(img_res.content)
+                with open(cover_path, 'rb') as f:
+                    await query.message.reply_photo(photo=f, caption=caption, parse_mode='HTML', reply_markup=keyboard)
+                await query.message.delete()
+            finally:
+                if os.path.exists(cover_path):
+                    try:
+                        os.remove(cover_path)
+                    except Exception:
+                        pass
         else:
             await query.edit_message_text(f"❌ Failed to load cover.\n{caption}", reply_markup=keyboard, parse_mode='HTML', disable_web_page_preview=True)
         return
@@ -1813,13 +1834,15 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tasks = [fetch_page(i, url, sem) for i, url in enumerate(image_urls, 1)]
             await asyncio.gather(*tasks)
             
-            with zipfile.ZipFile(cbz_path, 'w') as zf:
-                for f in os.listdir(cbz_dir):
-                    zf.write(os.path.join(cbz_dir, f), f)
+            def _create_wh_zip():
+                with zipfile.ZipFile(cbz_path, 'w') as zf:
+                    for f in os.listdir(cbz_dir):
+                        zf.write(os.path.join(cbz_dir, f), f)
+            await asyncio.to_thread(_create_wh_zip)
                     
             if os.path.getsize(cbz_path) > 50 * 1024 * 1024:
                 await query.edit_message_caption(caption=original_caption + "\n⏳ File over 50MB, uploading to Gofile...")
-                cloud_link = upload_to_gofile(cbz_path)
+                cloud_link = await asyncio.to_thread(upload_to_gofile, cbz_path)
                 if cloud_link:
                     track_stat(query.from_user.id, "downloads")
                     await query.edit_message_caption(caption=original_caption + f"\n✅ CBZ is too large for Telegram. Download here:\n🔗 {cloud_link}")
@@ -2136,7 +2159,7 @@ async def _fetch_ln_chapter(url, sem, loop):
     async with sem:
         from bs4 import BeautifulSoup
         from curl_cffi import requests as cffi_requests
-        r = await loop.run_in_executor(None, lambda: cffi_requests.get(url, impersonate="chrome110", timeout=15))
+        r = await loop.run_in_executor(scraper_executor, lambda: cffi_requests.get(url, impersonate="chrome110", timeout=15))
         soup = BeautifulSoup(r.text, 'html.parser')
         content = soup.find('div', class_='chapter-c')
         title_el = soup.find('a', class_='chapter-title')
@@ -2258,14 +2281,14 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_title = re.sub(r'[^\w\s-]', '', novel_title)[:50].strip()
             epub_filename = f"downloads/{safe_title}.epub"
             
-            epub.write_epub(epub_filename, book, {})
+            await asyncio.to_thread(epub.write_epub, epub_filename, book, {})
             
             file_size = os.path.getsize(epub_filename)
             caption = f"📖 <b>{novel_title}</b>\n📄 {len(ch_urls)} chapters\n\n🤖 <i>{VERSION}</i>"
 
             if file_size > 50 * 1024 * 1024:
                 await query.edit_message_text("⏳ EPUB is over 50MB, uploading to Gofile...")
-                cloud_link = upload_to_gofile(epub_filename)
+                cloud_link = await asyncio.to_thread(upload_to_gofile, epub_filename)
                 if cloud_link:
                     await query.edit_message_text(
                         f"{caption}\n\n✅ File was too large for Telegram:\n🔗 {cloud_link}",
@@ -2477,8 +2500,9 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Download all page images into a .cbz (zip) using concurrent tasks
             os.makedirs("downloads", exist_ok=True)
             safe_title = re.sub(r'[^\w\s-]', '', manga_id)[:40].strip()
+            safe_ch = re.sub(r'[^\w\s-]', '', os.path.basename(ch_suffix))[:30].strip()
             cbz_dir = f"downloads/mg_{uuid.uuid4().hex[:8]}"
-            cbz_filename = f"downloads/{safe_title}_{ch_suffix}.cbz"
+            cbz_filename = f"downloads/{safe_title}_{safe_ch}.cbz"
             os.makedirs(cbz_dir, exist_ok=True)
             sem = asyncio.Semaphore(15)
             async def fetch_page(idx, url):
@@ -2501,16 +2525,18 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tasks = [fetch_page(i, u) for i, u in enumerate(img_urls, 1)]
             await asyncio.gather(*tasks)
 
-            with zipfile.ZipFile(cbz_filename, "w", zipfile.ZIP_STORED) as zf:
-                for fname in sorted(os.listdir(cbz_dir)):
-                    zf.write(os.path.join(cbz_dir, fname), fname)
+            def _create_manga_zip():
+                with zipfile.ZipFile(cbz_filename, "w", zipfile.ZIP_STORED) as zf:
+                    for fname in sorted(os.listdir(cbz_dir)):
+                        zf.write(os.path.join(cbz_dir, fname), fname)
+            await asyncio.to_thread(_create_manga_zip)
 
             file_size = os.path.getsize(cbz_filename)
             caption = f"📖 <b>{manga_id} - {ch_suffix}</b>\n📄 {len(img_urls)} pages\n\n🤖 <i>{VERSION}</i>"
 
             if file_size > 50 * 1024 * 1024:
                 await query.edit_message_text("⏳ Chapter is over 50MB, uploading to Gofile...")
-                cloud_link = upload_to_gofile(cbz_filename)
+                cloud_link = await asyncio.to_thread(upload_to_gofile, cbz_filename)
                 if cloud_link:
                     await query.edit_message_text(
                         f"{caption}\n\n✅ File was too large for Telegram:\n🔗 {cloud_link}",
@@ -2588,10 +2614,18 @@ async def main():
     
     is_render = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
     if is_render:
+        WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+        if not WEBHOOK_SECRET and TOKEN:
+            WEBHOOK_SECRET = hashlib.sha256(TOKEN.encode()).hexdigest()
+
         # Set Telegram Webhook to point to Render with flood-control retry
         for attempt in range(5):
             try:
-                await application.bot.set_webhook(url=f"{RENDER_URL}/webhook", allowed_updates=["message", "callback_query", "message_reaction"])
+                await application.bot.set_webhook(
+                    url=f"{RENDER_URL}/webhook",
+                    allowed_updates=["message", "callback_query", "message_reaction"],
+                    secret_token=WEBHOOK_SECRET
+                )
                 logger.info(f"Telegram webhook set successfully to {RENDER_URL}/webhook")
                 break
             except RetryAfter as ra:
@@ -2605,6 +2639,10 @@ async def main():
             return web.Response(text="Bot is running!")
 
         async def telegram_webhook(request):
+            if WEBHOOK_SECRET:
+                req_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+                if req_secret != WEBHOOK_SECRET:
+                    return web.Response(status=403, text="Forbidden")
             try:
                 data = await request.json()
                 update = Update.de_json(data, application.bot)
@@ -2616,8 +2654,14 @@ async def main():
 
         async def get_logs(request):
             if os.path.exists("bot.log"):
-                with open("bot.log", "r", encoding="utf-8", errors="ignore") as f:
-                    return web.Response(text=f.read()[-5000:], content_type="text/plain")
+                try:
+                    size = os.path.getsize("bot.log")
+                    with open("bot.log", "r", encoding="utf-8", errors="ignore") as f:
+                        if size > 5000:
+                            f.seek(size - 5000)
+                        return web.Response(text=f.read(), content_type="text/plain")
+                except Exception as e:
+                    return web.Response(text=f"Error reading logs: {e}", content_type="text/plain")
             return web.Response(text="No logs yet", content_type="text/plain")
 
         # Setup aiohttp web server
