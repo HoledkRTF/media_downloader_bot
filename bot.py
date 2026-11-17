@@ -1562,9 +1562,11 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
         return False
 
     inflight_downloads.add(flight_id)
+    begin_download_activity()
     try:
         return await _process_single_link_impl(message, url, text, user_id)
     finally:
+        end_download_activity()
         inflight_downloads.discard(flight_id)
 
 async def _process_single_link_impl(message, url: str, text: str, user_id: int) -> bool:
