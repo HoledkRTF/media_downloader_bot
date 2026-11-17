@@ -153,6 +153,27 @@ def _install_bot_message_tracker():
 _install_bot_message_tracker()
 
 GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
+GLOBAL_PAGE_FETCH_SEMAPHORE = asyncio.Semaphore(20)
+MAX_ARCHIVE_PAGES = 500
+MAX_NOVEL_CHAPTERS = 2000
+
+# Files must not be swept while a download, archive build, or upload still uses them.
+_ACTIVE_DOWNLOADS = 0
+_ACTIVE_DOWNLOADS_LOCK = threading.Lock()
+
+def begin_download_activity():
+    global _ACTIVE_DOWNLOADS
+    with _ACTIVE_DOWNLOADS_LOCK:
+        _ACTIVE_DOWNLOADS += 1
+
+def end_download_activity():
+    global _ACTIVE_DOWNLOADS
+    with _ACTIVE_DOWNLOADS_LOCK:
+        _ACTIVE_DOWNLOADS = max(0, _ACTIVE_DOWNLOADS - 1)
+
+def has_active_downloads():
+    with _ACTIVE_DOWNLOADS_LOCK:
+        return _ACTIVE_DOWNLOADS > 0
 
 def _ensure_cookies():
     ig_cookie = os.environ.get('INSTAGRAM_SESSION_ID')
@@ -2203,6 +2224,7 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         cbz_dir = None
         cbz_path = None
+        begin_download_activity()
         try:
             from curl_cffi import requests as c_requests
             from bs4 import BeautifulSoup
@@ -2222,8 +2244,15 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     full_url = re.sub(r'//t\d*\.', '//i.', thumb_url).replace('t.', '.')
                     image_urls.append(full_url)
                     
-            cbz_dir = f"downloads/nh_{code}"
-            cbz_path = f"downloads/nh_{code}.cbz"
+            if len(image_urls) > MAX_ARCHIVE_PAGES:
+                await query.edit_message_caption(
+                    caption=original_caption + f"\n❌ This archive has {len(image_urls)} pages; the limit is {MAX_ARCHIVE_PAGES}."
+                )
+                return
+
+            request_id = uuid.uuid4().hex[:10]
+            cbz_dir = f"downloads/nh_{code}_{request_id}"
+            cbz_path = f"downloads/nh_{code}_{request_id}.cbz"
             os.makedirs(cbz_dir, exist_ok=True)
             
             async def fetch_page(idx, url, sem):
@@ -2234,7 +2263,7 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         with open(f"{cbz_dir}/{idx:03d}.{ext}", 'wb') as f:
                             f.write(img_res.content)
                             
-            sem = asyncio.Semaphore(15)
+            sem = GLOBAL_PAGE_FETCH_SEMAPHORE
             tasks = [fetch_page(i, url, sem) for i, url in enumerate(image_urls, 1)]
             await asyncio.gather(*tasks)
             
@@ -2269,10 +2298,14 @@ async def wh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     os.remove(cbz_path)
                 except Exception:
                     pass
+            end_download_activity()
         return
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     """Periodic cleanup of orphan files and directories in downloads/"""
+    # Defer the sweep while a download, archive build, or upload may still be using files.
+    if has_active_downloads():
+        return
     if os.path.exists('downloads'):
         import shutil
         now = time.time()
@@ -2468,7 +2501,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Truncate if too long for Telegram (4096 limit)
             if len(recent_logs) > 4000:
                 recent_logs = "..." + recent_logs[-4000:]
-            await update.message.reply_text(f"📝 <b>Recent Logs:</b>\n<pre>{recent_logs.replace('<', '&lt;').replace('>', '&gt;')}</pre>", parse_mode='HTML')
+            await update.message.reply_text(f"📝 <b>Recent Logs:</b>\n<pre>{html.escape(recent_logs)}</pre>", parse_mode='HTML')
     else:
         await update.message.reply_text("📭 No log file found.")
 
@@ -2551,7 +2584,7 @@ async def ln_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(label, callback_data=f"ln_sel_{ch_id}")])
 
         await reply_msg.edit_text(
-            f"📚 <b>Results for '{query}':</b>\n<i>Select a novel:</i>",
+            f"📚 <b>Results for '{html.escape(query)}':</b>\n<i>Select a novel:</i>",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
         )
     except Exception as e:
@@ -2619,7 +2652,7 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard = [[InlineKeyboardButton(f"⬇️ Build EPUB ({len(ch_urls)} chapters)", callback_data=f"ln_dl_{novel_id}")]]
             await query.edit_message_text(
-                f"📖 <b>{search_data['label']}</b>\n📄 {len(ch_urls)} chapters available.",
+                f"📖 <b>{html.escape(search_data['label'])}</b>\n📄 {len(ch_urls)} chapters available.",
                 reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
             )
         except Exception as e:
@@ -2636,11 +2669,18 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Session expired. Please search again with /ln.")
             return
 
+        if len(ch_urls) > MAX_NOVEL_CHAPTERS:
+            await query.edit_message_text(
+                f"❌ This novel has {len(ch_urls)} chapters; the per-book limit is {MAX_NOVEL_CHAPTERS}."
+            )
+            return
+
         await query.edit_message_text(f"⏳ Building EPUB for {len(ch_urls)} chapters...\nThis will take a few minutes.")
 
         epub_filename = None
+        begin_download_activity()
         try:
-            sem = asyncio.Semaphore(20)
+            sem = GLOBAL_PAGE_FETCH_SEMAPHORE
             loop = asyncio.get_running_loop()
             
             progress = {'done': 0, 'total': len(ch_urls)}
@@ -2681,13 +2721,13 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             book.spine = spine
             
             os.makedirs("downloads", exist_ok=True)
-            safe_title = re.sub(r'[^\w\s-]', '', novel_title)[:50].strip()
-            epub_filename = f"downloads/{safe_title}.epub"
+            safe_title = re.sub(r'[^\w\s-]', '', novel_title)[:50].strip() or "novel"
+            epub_filename = f"downloads/{safe_title}_{uuid.uuid4().hex[:10]}.epub"
             
             await asyncio.to_thread(epub.write_epub, epub_filename, book, {})
             
             file_size = os.path.getsize(epub_filename)
-            caption = f"📖 <b>{novel_title}</b>\n📄 {len(ch_urls)} chapters\n\n🤖 <i>{VERSION}</i>"
+            caption = f"📖 <b>{html.escape(novel_title)}</b>\n📄 {len(ch_urls)} chapters\n\n🤖 <i>{VERSION}</i>"
 
             if file_size > 50 * 1024 * 1024:
                 await query.edit_message_text("⏳ EPUB is over 50MB, uploading to Gofile...")
@@ -2719,6 +2759,7 @@ async def ln_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     os.remove(epub_filename)
                 except Exception:
                     pass
+            end_download_activity()
         return
 
 # ── MangaKatana Integration ──────────────────────────────────────────────
@@ -2753,7 +2794,7 @@ async def manga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(label, callback_data=f"mg_sel_{manga_id[:40]}")])
 
         await reply_msg.edit_text(
-            f"📚 <b>Results for '{query}':</b>\n<i>Select a manga:</i>",
+            f"📚 <b>Results for '{html.escape(query)}':</b>\n<i>Select a manga:</i>",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
         )
     except Exception as e:
@@ -2880,6 +2921,7 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cbz_dir = None
         cbz_filename = None
+        begin_download_activity()
         try:
             ch_url = f"https://mangakatana.com/manga/{manga_id}/{ch_suffix}"
             r = await asyncio.to_thread(
@@ -2898,16 +2940,23 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ Could not extract images from chapter page.")
                 return
 
+            if len(img_urls) > MAX_ARCHIVE_PAGES:
+                await query.edit_message_text(
+                    f"❌ This chapter has {len(img_urls)} pages; the limit is {MAX_ARCHIVE_PAGES}."
+                )
+                return
+
             await query.edit_message_text(f"⏳ Downloading {len(img_urls)} pages in parallel...")
 
             # Download all page images into a .cbz (zip) using concurrent tasks
             os.makedirs("downloads", exist_ok=True)
-            safe_title = re.sub(r'[^\w\s-]', '', manga_id)[:40].strip()
-            safe_ch = re.sub(r'[^\w\s-]', '', os.path.basename(ch_suffix))[:30].strip()
-            cbz_dir = f"downloads/mg_{uuid.uuid4().hex[:8]}"
-            cbz_filename = f"downloads/{safe_title}_{safe_ch}.cbz"
+            request_id = uuid.uuid4().hex[:10]
+            safe_title = re.sub(r'[^\w\s-]', '', manga_id)[:40].strip() or "manga"
+            safe_ch = re.sub(r'[^\w\s-]', '', os.path.basename(ch_suffix))[:30].strip() or "chapter"
+            cbz_dir = f"downloads/mg_{request_id}"
+            cbz_filename = f"downloads/{safe_title}_{safe_ch}_{request_id}.cbz"
             os.makedirs(cbz_dir, exist_ok=True)
-            sem = asyncio.Semaphore(15)
+            sem = GLOBAL_PAGE_FETCH_SEMAPHORE
             async def fetch_page(idx, url):
                 async with sem:
                     try:
@@ -2935,7 +2984,7 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(_create_manga_zip)
 
             file_size = os.path.getsize(cbz_filename)
-            caption = f"📖 <b>{manga_id} - {ch_suffix}</b>\n📄 {len(img_urls)} pages\n\n🤖 <i>{VERSION}</i>"
+            caption = f"📖 <b>{html.escape(manga_id)} - {html.escape(ch_suffix)}</b>\n📄 {len(img_urls)} pages\n\n🤖 <i>{VERSION}</i>"
 
             if file_size > 50 * 1024 * 1024:
                 await query.edit_message_text("⏳ Chapter is over 50MB, uploading to Gofile...")
@@ -2970,6 +3019,7 @@ async def manga_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     os.remove(cbz_filename)
                 except Exception:
                     pass
+            end_download_activity()
         return
 
 
