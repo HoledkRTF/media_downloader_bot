@@ -26,8 +26,9 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 import hashlib
+from urllib.parse import urlparse
 
-VERSION = "v2.16.0"
+VERSION = "v2.17.0"
 
 # Enable logging with rotation and silenced verbose URLs
 logging.basicConfig(
@@ -521,6 +522,22 @@ async def _on_download_success(user_id, url=None, original_url=None, title=None,
             pass
 
 
+async def _report_failure(reply_msg, reason: str):
+    """Turns a transient status message into a short, actionable error instead of going silent."""
+    text = (
+        f"❌ <b>Couldn't fetch this one.</b>\n"
+        f"<i>{html.escape(str(reason)[:300])}</i>\n\n"
+        "Send /retry to try again."
+    )
+    try:
+        await reply_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        try:
+            await reply_msg.delete()
+        except Exception:
+            pass
+
+
 def extract_urls_from_message(msg):
     if not msg:
         return []
@@ -626,6 +643,9 @@ def fetch_twitter_details(url):
         logger.error(f"vxtwitter API error in fetch_twitter_details: {e}")
     return None
 
+# Hard per-item ceiling for gallery downloads (raw Reddit GIFs can exceed 40MB each)
+MAX_GALLERY_ITEM_BYTES = 120 * 1024 * 1024
+
 def _download_media_urls_parallel(media_items, session=None, max_workers=8):
     """Downloads a list of URLs or (url, ext_hint) tuples in parallel preserving order."""
     if not media_items:
@@ -639,9 +659,13 @@ def _download_media_urls_parallel(media_items, session=None, max_workers=8):
             m_url, ext_hint = item[0], item[1]
         else:
             m_url, ext_hint = item, None
+        fname = None
         try:
-            m_res = s.get(m_url, timeout=15)
-            if m_res.status_code == 200:
+            # Stream to disk instead of buffering whole responses: gallery GIFs are routinely
+            # 10-45 MB each, so reading them all into memory at once is what OOMs small hosts.
+            with s.get(m_url, timeout=(15, 60), stream=True) as m_res:
+                if m_res.status_code != 200:
+                    return None
                 ct = m_res.headers.get('content-type', '').lower()
                 if 'html' in ct or 'text' in ct:
                     return None
@@ -651,17 +675,81 @@ def _download_media_urls_parallel(media_items, session=None, max_workers=8):
                     if len(ext) > 4 or not ext:
                         ext = 'jpg'
                 fname = f"downloads/reddit_{uuid.uuid4().hex}.{ext}"
+                written = 0
                 with open(fname, 'wb') as f:
-                    f.write(m_res.content)
-                return fname
+                    for chunk in m_res.iter_content(64 * 1024):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > MAX_GALLERY_ITEM_BYTES:
+                            raise ValueError(f"item larger than {MAX_GALLERY_ITEM_BYTES // (1024 * 1024)}MB cap")
+                        f.write(chunk)
+                if written > 0:
+                    return fname
+                return None
         except Exception as e:
             logger.warning(f"Failed to download gallery item {m_url}: {e}")
+            if fname and os.path.exists(fname):
+                try:
+                    os.remove(fname)
+                except Exception:
+                    pass
         return None
 
     workers = min(max_workers, max(1, len(media_items)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(_download_one, media_items))
     return [f for f in results if f]
+
+# Hosts a Reddit submission can link to for externally hosted media
+REDDIT_EXTERNAL_MEDIA_HOSTS = (
+    'redgifs.com', 'gfycat.com', 'imgur.com', 'streamable.com',
+    'erome.com', 'pornhub.com', 'pornhub.org', 'spankbang.com', 'xhamster.com',
+)
+
+def _resolve_reddit_post_feed(session, url):
+    """Resolve a Reddit post's real media target from its Atom feed.
+
+    Reddit's .json API answers datacenter IPs with a "blocked" page and the HTML page is a JS
+    shell, but https://www.reddit.com/comments/<id>.rss still returns the submission body, which
+    carries the outbound link for externally hosted posts (RedGifs, Imgur, ...) and any direct
+    i.redd.it / v.redd.it asset.
+
+    Returns (external_url, direct_media_urls, title).
+    """
+    match = re.search(r'/comments/([a-z0-9]+)', url, re.IGNORECASE)
+    if not match:
+        return None, [], None
+    try:
+        res = session.get(
+            f"https://www.reddit.com/comments/{match.group(1)}.rss",
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+            timeout=10
+        )
+        if res.status_code != 200:
+            return None, [], None
+        feed = res.text
+        # Only the submission entry matters; comment entries would add unrelated links
+        entry = re.search(r'<entry>(.*?)</entry>', feed, re.S)
+        body = entry.group(1) if entry else feed
+        title = None
+        title_match = re.search(r'<title>(.*?)</title>', body, re.S)
+        if title_match:
+            title = html.unescape(title_match.group(1)).strip()[:300] or None
+        direct, external = [], None
+        for href in re.findall(r'href="([^"]+)"', html.unescape(body)):
+            host = urlparse(href).netloc.lower()
+            if not host:
+                continue
+            if host in ('i.redd.it', 'v.redd.it', 'packaged-media.redd.it'):
+                if href not in direct:
+                    direct.append(href)
+            elif external is None and any(domain in host for domain in REDDIT_EXTERNAL_MEDIA_HOSTS):
+                external = href
+        return external, direct, title
+    except Exception as e:
+        logger.warning(f"Reddit Atom feed lookup failed: {e}")
+        return None, [], None
 
 async def download_media(url: str, media_indices: list = None, as_files: bool = False):
     """Returns (files, title, original_url)"""
@@ -716,6 +804,23 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                     for meta in soup.find_all('meta', property='og:image'):
                         c = meta.get('content')
                         if c and c not in image_urls: image_urls.append(c)
+
+                # Thumbnails only (or nothing at all): this is an externally hosted post
+                # (RedGifs, Imgur, ...) where vxreddit has no embed to offer. The Atom feed knows
+                # the real target, so fetch that instead of quietly shipping a 15KB preview JPEG.
+                if not image_urls or all(
+                    'preview.redd.it' in u or 'external-preview' in u for u in image_urls
+                ):
+                    feed_external, feed_media, feed_title = _resolve_reddit_post_feed(s, url)
+                    if feed_title and not title:
+                        title = feed_title
+                    if feed_media:
+                        feed_files = _download_media_urls_parallel(feed_media, session=s)
+                        if feed_files:
+                            return feed_files, None
+                    if feed_external:
+                        logger.info(f"Reddit post links to externally hosted media: {feed_external}")
+                        return [], feed_external
 
                 if image_urls:
                     if media_indices:
@@ -969,7 +1074,8 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                 has_gifs = any(f.lower().endswith('.gif') for f in file_list)
                 if not has_gifs:
                     return file_list
-                with ThreadPoolExecutor(max_workers=min(3, len(file_list))) as executor:
+                # Two at a time: each encode holds a decoded frame stack, and small hosts are tight
+                with ThreadPoolExecutor(max_workers=min(2, len(file_list))) as executor:
                     return list(executor.map(convert_gif_to_mp4, file_list))
             files = await asyncio.to_thread(_batch_convert, files)
 
@@ -1069,6 +1175,18 @@ def get_video_dimensions(filepath):
         pass
     return None, None
 
+def _run_ffmpeg_gif_encode(gif_path, out_path, vf, preset, crf, timeout):
+    cmd = [
+        'ffmpeg', '-y', '-i', gif_path,
+        '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+        '-an', '-movflags', 'faststart',
+        '-pix_fmt', 'yuv420p',
+        '-vf', vf,
+        out_path
+    ]
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+
+
 def convert_gif_to_mp4(gif_path):
     """Convert GIF to streamable H.264 MP4. Returns converted mp4 path if successful, else original path."""
     if not gif_path or not gif_path.lower().endswith('.gif'):
@@ -1077,16 +1195,22 @@ def convert_gif_to_mp4(gif_path):
     basename = os.path.basename(gif_path)
     stem = os.path.splitext(basename)[0]
     out_path = os.path.join(dirname, f"anim_{stem}.mp4")
-    try:
-        cmd = [
-            'ffmpeg', '-y', '-i', gif_path,
-            '-c:v', 'libx264', '-preset', 'faster', '-crf', '24',
-            '-an', '-movflags', 'faststart',
-            '-pix_fmt', 'yuv420p',
-            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-            out_path
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    # Preserve the source frame rate and resolution so motion stays as smooth as the original;
+    # only oversized sources are downscaled (width capped at 1080, never upscaled). crf 23 keeps it
+    # visually clean, and a lighter encode is used only if the first attempt overruns its budget.
+    attempts = (
+        ("scale='trunc(min(iw,1080)/2)*2':-2", 'veryfast', 23, 180),
+        ("scale=-2:'min(720,ih)'", 'ultrafast', 28, 120),
+    )
+    for vf, preset, crf, timeout in attempts:
+        try:
+            res = _run_ffmpeg_gif_encode(gif_path, out_path, vf, preset, crf, timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"GIF encode overran {timeout}s at {preset}/crf{crf}; falling back to a lighter encode")
+            continue
+        except Exception as e:
+            logger.warning(f"Failed to convert gif to mp4: {e}")
+            break
         if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             if os.path.exists(gif_path):
                 try:
@@ -1094,8 +1218,13 @@ def convert_gif_to_mp4(gif_path):
                 except Exception:
                     pass
             return out_path
-    except Exception as e:
-        logger.warning(f"Failed to convert gif to mp4: {e}")
+        break
+    # No usable encode: leave nothing partial behind and let the caller send the original
+    if os.path.exists(out_path):
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
     return gif_path
 
 def upload_to_gofile(filepath):
@@ -1121,11 +1250,8 @@ async def send_album(message, files, as_files, caption=None):
     """Send multiple files as media group or document group."""
     handles = []
     try:
-        if not as_files and files and any(f.lower().endswith('.gif') for f in files):
-            with ThreadPoolExecutor(max_workers=min(3, len(files))) as ex:
-                converted = list(ex.map(convert_gif_to_mp4, files))
-                files.clear()
-                files.extend(converted)
+        # GIF->MP4 conversion already happened in download_media; converting again here just
+        # burned minutes on the same files, so this stage only sends.
         # Check files for size limit. Any file > 50MB gets sent to Gofile instead.
         large_files = []
         valid_files = []
@@ -1173,6 +1299,8 @@ async def send_album(message, files, as_files, caption=None):
                     dim_results = list(ex.map(get_video_dimensions, anim_files))
                 dim_map = dict(zip(anim_files, dim_results))
 
+                sent = 0
+                last_error = None
                 for idx, f in enumerate(anim_files):
                     w, h = dim_map.get(f, (None, None))
                     v_kw = {'read_timeout': 300, 'write_timeout': 300}
@@ -1180,9 +1308,19 @@ async def send_album(message, files, as_files, caption=None):
                     if h: v_kw['height'] = h
                     cap = caption if idx == 0 else None
                     pm = 'HTML' if cap else None
-                    handle = open(f, 'rb')
-                    handles.append(handle)
-                    await message.reply_animation(animation=handle, caption=cap, parse_mode=pm, allow_sending_without_reply=True, **v_kw)
+                    try:
+                        with open(f, 'rb') as handle:
+                            await message.reply_animation(animation=handle, caption=cap, parse_mode=pm, allow_sending_without_reply=True, **v_kw)
+                        sent += 1
+                    except Exception as anim_err:
+                        # One rejected animation must not discard the rest of the catalogue
+                        last_error = anim_err
+                        size_mb = os.path.getsize(f) / (1024 * 1024) if os.path.exists(f) else -1
+                        logger.warning(f"Animation upload failed for {os.path.basename(f)} ({size_mb:.1f}MB): {anim_err}")
+                if sent == 0:
+                    raise RuntimeError(f"all {len(anim_files)} animation uploads failed: {last_error}")
+                if sent < len(anim_files):
+                    logger.warning(f"Delivered {sent}/{len(anim_files)} animations for this album")
                 return
 
             group = []
@@ -1200,8 +1338,17 @@ async def send_album(message, files, as_files, caption=None):
                     group.append(InputMediaVideo(handle, caption=cap, parse_mode=pm, width=w, height=h, supports_streaming=True))
                 else:
                     group.append(InputMediaPhoto(handle, caption=cap, parse_mode=pm))
+            groups_sent = 0
+            last_group_error = None
             for chunk in chunk_list(group, 10):
-                await message.reply_media_group(media=chunk, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
+                try:
+                    await message.reply_media_group(media=chunk, allow_sending_without_reply=True, read_timeout=300, write_timeout=300)
+                    groups_sent += 1
+                except Exception as grp_err:
+                    last_group_error = grp_err
+                    logger.warning(f"Media group upload failed ({len(chunk)} items): {grp_err}")
+            if groups_sent == 0:
+                raise RuntimeError(f"all media group uploads failed: {last_group_error}")
     finally:
         for h in handles:
             h.close()
@@ -1378,10 +1525,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
             if tw_data == "ERROR_REGION_BLOCKED":
                 add_failed_download(user_id, url, text, "Region blocked on Twitter")
                 record_download_history(user_id, url=url, status="failed", error="Region blocked on Twitter", message_id=message.message_id)
-                try:
-                    await reply_msg.delete()
-                except Exception:
-                    pass
+                await _report_failure(reply_msg, "This one is blocked in the bot's region (Twitter regional restriction), so there is nothing to fetch.")
                 return False
             if tw_data and tw_data.get('items'):
                 items = tw_data['items']
@@ -1495,10 +1639,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
         if not files:
             add_failed_download(user_id, url, text, "No media found")
             record_download_history(user_id, url=url, status="failed", error="No media found", message_id=message.message_id)
-            try:
-                await reply_msg.delete()
-            except Exception:
-                pass
+            await _report_failure(reply_msg, "No downloadable media was found at this link.")
             return False
 
         try:
@@ -1515,10 +1656,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
             if not os.path.exists(f) or os.path.getsize(f) == 0:
                 add_failed_download(user_id, url, text, "File empty or missing after download")
                 record_download_history(user_id, url=url, status="failed", error="File empty or missing after download", message_id=message.message_id)
-                try:
-                    await reply_msg.delete()
-                except Exception:
-                    pass
+                await _report_failure(reply_msg, "The downloaded file came back empty or disappeared before upload.")
                 return False
             try:
                 if os.path.getsize(f) > 50 * 1024 * 1024:
@@ -1531,10 +1669,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                     else:
                         add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
                         record_download_history(user_id, url=url, status="failed", error="File >50MB and cloud upload failed", message_id=message.message_id)
-                        try:
-                            await reply_msg.delete()
-                        except Exception:
-                            pass
+                        await _report_failure(reply_msg, "The file is over Telegram's 50MB limit and the cloud upload failed.")
                         return False
                         
                 vault_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❤️ Vault", callback_data="vault_this")]])
@@ -1567,10 +1702,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                         logger.error(f"Retry as document failed: {retry_e}")
                 add_failed_download(user_id, url, text, f"Failed to send: {e}")
                 record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
-                try:
-                    await reply_msg.delete()
-                except Exception:
-                    pass
+                await _report_failure(reply_msg, f"Telegram rejected the upload: {e}")
                 return False
             finally:
                 if os.path.exists(f):
@@ -1595,10 +1727,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                 logger.error(f"Failed to send album: {e}")
                 add_failed_download(user_id, url, text, f"Failed to send album: {e}")
                 record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
-                try:
-                    await reply_msg.delete()
-                except Exception:
-                    pass
+                await _report_failure(reply_msg, f"Failed to send the album: {e}")
                 return False
             finally:
                 for f in files:
@@ -1621,20 +1750,14 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
             error_msg = error_msg[:800] + "... [Truncated]"
         add_failed_download(user_id, url, text, f"Download failed: {error_msg[:120]}")
         record_download_history(user_id, url=url, status="failed", error=str(error_msg)[:120], message_id=message.message_id)
-        try:
-            await reply_msg.delete()
-        except Exception:
-            pass
+        await _report_failure(reply_msg, error_msg)
         return False
     except Exception as e:
         import traceback
         logger.error(f"Error processing link: {e}\n{traceback.format_exc()}")
         add_failed_download(user_id, url, text, f"Error: {e}")
         record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
-        try:
-            await reply_msg.delete()
-        except Exception:
-            pass
+        await _report_failure(reply_msg, e)
         return False
 
 async def handle_replied_link(message, reply_to, url: str, user_text: str, user_id: int):
