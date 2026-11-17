@@ -1443,6 +1443,9 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
     if len(urls) > 1:
         as_files = bool(re.search(r'\s-f\b', text))
         flag_suffix = " -f" if as_files else ""
+        # Each link keeps the numbers/ranges typed after it, instead of all of them
+        # collapsing onto the first link (or being dropped for links after it).
+        link_selections = extract_link_selections(text, urls)
         status_msg = await message.reply_text(f"📋 Found {len(urls)} links! Starting downloads...")
         succeeded = 0
         failed = 0
@@ -1455,7 +1458,8 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
                 )
             except Exception:
                 pass
-            single_text = f"{single_url}{flag_suffix}"
+            selection = link_selections.get(_link_key(single_url), "")
+            single_text = " ".join(p for p in (single_url, selection, flag_suffix.strip()) if p)
             success = await process_single_link(message, single_url, single_text, user_id)
             if success:
                 succeeded += 1
@@ -1500,6 +1504,33 @@ def parse_media_indices(text, url):
             except Exception:
                 pass
     return sorted(indices) if indices else None
+
+
+def _link_key(url):
+    """Normalises a URL so it can be matched against its plain-text occurrence."""
+    return (url or '').strip().rstrip(').,;!?').lower()
+
+
+def extract_link_selections(text, urls):
+    """Map each link in a multi-link message to the item numbers/ranges written after it.
+
+    "linkA 1,3 linkB 2-4" -> {linkA: "1 3", linkB: "2-4"}, so splitting a message into
+    per-link downloads no longer throws away each link's own selection.
+    """
+    text = text or ''
+    selections = {}
+    matches = list(re.finditer(r'https?://[^\s<>\"]+', text))
+    for i, match in enumerate(matches):
+        tail_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        picks = []
+        for token in re.split(r'[\s,;]+', text[match.end():tail_end]):
+            token = token.strip(' .,;:!?()[]{}').strip('"').strip("'")
+            if re.fullmatch(r'\d+(?:-\d+)?', token):
+                picks.append(token)
+        if picks:
+            key = _link_key(match.group(0))
+            selections[key] = (selections.get(key, '') + ' ' + ' '.join(picks)).strip()
+    return selections
 
 
 async def process_single_link(message, url: str, text: str, user_id: int) -> bool:
