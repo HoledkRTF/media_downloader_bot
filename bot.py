@@ -1579,7 +1579,9 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                         [InlineKeyboardButton("❤️ Vault", callback_data="vault_this")],
                         [InlineKeyboardButton("📥 Direct Full-Res File", url=item['full_res'])]
                     ])
-                    v_kwargs = {'supports_streaming': True, 'read_timeout': 300, 'write_timeout': 300}
+                    # supports_streaming is only valid for reply_video, never for reply_animation,
+                    # so it is passed at the call site instead of riding along in these kwargs
+                    v_kwargs = {'read_timeout': 300, 'write_timeout': 300}
                     if item.get('width'): v_kwargs['width'] = item['width']
                     if item.get('height'): v_kwargs['height'] = item['height']
                     try:
