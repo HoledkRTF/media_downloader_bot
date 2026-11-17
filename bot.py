@@ -569,7 +569,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "or most video sites and I'll grab the media for you.\n"
         "• Add <code>-f</code> after a link to get raw files instead of compressed media\n"
         "• For albums, add numbers to pick specific items: "
-        "<code>https://reddit.com/... 1 3 5</code>\n"
+        "<code>https://reddit.com/... 1 3 5</code> or <code>1,3,5</code>\n"
         "• Use ranges too: <code>https://reddit.com/... 2-6</code>\n"
         "• /retry — Retry any previously failed downloads (/retry list, /retry clear)\n"
         "• /clean — Clean up all bot responses & media while keeping your link messages intact\n\n"
@@ -1478,6 +1478,30 @@ async def process_media_request(message, text: str, user_id: int) -> bool:
 
     return await process_single_link(message, urls[0], text, user_id)
 
+def parse_media_indices(text, url):
+    """Extract 1-based item selections from a message body.
+
+    Users write "1 3 5", "1,3,5" and "2-6" interchangeably; a comma-separated list used to be
+    ignored entirely, which silently downloaded the whole catalogue.
+    """
+    clean_text = (text or '').replace(url, '').replace('-f', '').strip()
+    indices = set()
+    for token in re.split(r'[\s,;]+', clean_text):
+        token = token.strip()
+        if not token:
+            continue
+        if re.fullmatch(r'\d+', token):
+            indices.add(int(token))
+        elif re.fullmatch(r'\d+-\d+', token):
+            try:
+                start, end = map(int, token.split('-'))
+                if start <= end and end - start < 100:
+                    indices.update(range(start, end + 1))
+            except Exception:
+                pass
+    return sorted(indices) if indices else None
+
+
 async def process_single_link(message, url: str, text: str, user_id: int) -> bool:
     norm_key = normalize_history_url(url)
     flight_id = (user_id, norm_key)
@@ -1494,22 +1518,7 @@ async def process_single_link(message, url: str, text: str, user_id: int) -> boo
 async def _process_single_link_impl(message, url: str, text: str, user_id: int) -> bool:
     as_files = bool(re.search(r'\s-f\b', text))
 
-    clean_text = text.replace(url, '').replace('-f', '').strip()
-    
-    # Extract numbers and ranges for indices
-    media_indices = set()
-    for token in clean_text.split():
-        if re.match(r'^\d+$', token):
-            media_indices.add(int(token))
-        elif re.match(r'^\d+-\d+$', token):
-            try:
-                start, end = map(int, token.split('-'))
-                if start <= end and end - start < 100:
-                    media_indices.update(range(start, end + 1))
-            except:
-                pass
-                
-    media_indices = sorted(list(media_indices)) if media_indices else None
+    media_indices = parse_media_indices(text, url)
 
     reply_msg = await message.reply_text("⏳ Processing link...")
     try:
