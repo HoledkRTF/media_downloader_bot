@@ -28,7 +28,7 @@ from logging.handlers import RotatingFileHandler
 import hashlib
 from urllib.parse import urlparse
 
-VERSION = "v2.17.0"
+VERSION = "v2.17.1"
 
 # Enable logging with rotation and silenced verbose URLs
 logging.basicConfig(
@@ -154,6 +154,10 @@ _install_bot_message_tracker()
 
 GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
 GLOBAL_PAGE_FETCH_SEMAPHORE = asyncio.Semaphore(20)
+# GIF->MP4 encodes are CPU-bound and slow (a large catalogue spends minutes in ffmpeg), so they
+# get their own budget instead of occupying download slots that other users are waiting on.
+GIF_ENCODE_SEMAPHORE = asyncio.Semaphore(2)
+GIF_ENCODE_WORKERS = 2
 MAX_ARCHIVE_PAGES = 500
 MAX_NOVEL_CHAPTERS = 2000
 
@@ -529,13 +533,23 @@ def get_download_history_item(user_id, url):
 
 async def _on_download_success(user_id, url=None, original_url=None, title=None, message_id=None, reply_msg=None):
     target = original_url or url
-    track_stat(user_id, "downloads", url=target)
-    if url:
-        remove_failed_download(user_id, url)
-    if original_url and original_url != url:
-        remove_failed_download(user_id, original_url)
-    if target:
-        record_download_history(user_id, url=target, status="success", title=title, message_id=message_id)
+
+    def _persist_success():
+        track_stat(user_id, "downloads", url=target)
+        if url:
+            remove_failed_download(user_id, url)
+        if original_url and original_url != url:
+            remove_failed_download(user_id, original_url)
+        if target:
+            record_download_history(user_id, url=target, status="success", title=title, message_id=message_id)
+
+    # Stats/history are blocking Mongo or locked-file writes; keeping them off the event loop
+    # stops one finished download from stalling every other update being processed.
+    try:
+        await asyncio.to_thread(_persist_success)
+    except Exception as e:
+        # The media is already delivered: a bookkeeping failure must not turn a success into an error
+        logger.error(f"Could not persist success for {target}: {e}")
     if reply_msg:
         try:
             await reply_msg.delete()
@@ -557,6 +571,23 @@ async def _report_failure(reply_msg, reason: str):
             await reply_msg.delete()
         except Exception:
             pass
+
+
+def _persist_failure(user_id, url, text, reason, message_id, history_error):
+    """Blocking retry-queue and history writes for a failed download."""
+    add_failed_download(user_id, url, text, reason)
+    record_download_history(user_id, url=url, status="failed", error=history_error, message_id=message_id)
+
+
+async def _record_failure(user_id, url, text, reason, message_id, history_error=None):
+    """Queues a failure for /retry without holding up the event loop."""
+    try:
+        await asyncio.to_thread(
+            _persist_failure, user_id, url, text, reason, message_id,
+            str(history_error if history_error is not None else reason)
+        )
+    except Exception as e:
+        logger.error(f"Could not record failure for {url}: {e}")
 
 
 def extract_urls_from_message(msg):
@@ -1025,12 +1056,23 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
                         play_url = data['data']['play']
                         title = data['data'].get('title', '')
                         
-                        m_res = requests.get(play_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
-                        if m_res.status_code == 200:
-                            filename = f"{req_dir}/tiktok_{uuid.uuid4().hex}.mp4"
-                            with open(filename, 'wb') as f:
-                                f.write(m_res.content)
+                        filename = f"{req_dir}/tiktok_{uuid.uuid4().hex}.mp4"
+                        written = 0
+                        # Stream to disk: buffering a whole clip in RAM is what starves small hosts
+                        with requests.get(play_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30, stream=True) as m_res:
+                            if m_res.status_code == 200:
+                                with open(filename, 'wb') as f:
+                                    for chunk in m_res.iter_content(64 * 1024):
+                                        if chunk:
+                                            f.write(chunk)
+                                            written += len(chunk)
+                        if written:
                             return [filename]
+                        if os.path.exists(filename):
+                            try:
+                                os.remove(filename)
+                            except Exception:
+                                pass
             except Exception as e:
                 logger.error(f"TikTok tikwm fallback failed: {e}")
                 # Fall through to yt-dlp if it fails
@@ -1090,14 +1132,15 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
 
     async with GLOBAL_DOWNLOAD_SEMAPHORE:
         files = await asyncio.to_thread(_download)
-        if not as_files and files:
-            def _batch_convert(file_list):
-                has_gifs = any(f.lower().endswith('.gif') for f in file_list)
-                if not has_gifs:
-                    return file_list
-                # Two at a time: each encode holds a decoded frame stack, and small hosts are tight
-                with ThreadPoolExecutor(max_workers=min(2, len(file_list))) as executor:
-                    return list(executor.map(convert_gif_to_mp4, file_list))
+
+    # Encode outside the download semaphore: a 20-GIF catalogue can spend minutes in ffmpeg, and
+    # holding download slots that long starved every other user's fetch behind it.
+    if not as_files and files and any(f.lower().endswith('.gif') for f in files):
+        def _batch_convert(file_list):
+            # Two at a time: each encode holds a decoded frame stack, and small hosts are tight
+            with ThreadPoolExecutor(max_workers=min(GIF_ENCODE_WORKERS, len(file_list))) as executor:
+                return list(executor.map(convert_gif_to_mp4, file_list))
+        async with GIF_ENCODE_SEMAPHORE:
             files = await asyncio.to_thread(_batch_convert, files)
 
     if files:
@@ -1345,9 +1388,12 @@ async def send_album(message, files, as_files, caption=None):
                 return
 
             group = []
-            with ThreadPoolExecutor(max_workers=min(6, len(valid_files))) as ex:
-                dim_results = list(ex.map(get_video_dimensions, valid_files))
-            dim_map = dict(zip(valid_files, dim_results))
+            # Only real videos need ffprobe; probing photos spawned a subprocess per image for nothing
+            video_files = [f for f in valid_files if f.endswith(('.mp4', '.webm', '.mkv', '.gif'))]
+            dim_map = {}
+            if video_files:
+                with ThreadPoolExecutor(max_workers=min(6, len(video_files))) as ex:
+                    dim_map = dict(zip(video_files, list(ex.map(get_video_dimensions, video_files))))
 
             for i, f in enumerate(valid_files):
                 handle = open(f, 'rb')
@@ -1586,8 +1632,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
         try:
             tw_data = await asyncio.to_thread(fetch_twitter_details, url)
             if tw_data == "ERROR_REGION_BLOCKED":
-                add_failed_download(user_id, url, text, "Region blocked on Twitter")
-                record_download_history(user_id, url=url, status="failed", error="Region blocked on Twitter", message_id=message.message_id)
+                await _record_failure(user_id, url, text, "Region blocked on Twitter", message.message_id)
                 await _report_failure(reply_msg, "This one is blocked in the bot's region (Twitter regional restriction), so there is nothing to fetch.")
                 return False
             if tw_data and tw_data.get('items'):
@@ -1702,8 +1747,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
 
         files, title, original_url = await download_media(url, media_indices, as_files=as_files)
         if not files:
-            add_failed_download(user_id, url, text, "No media found")
-            record_download_history(user_id, url=url, status="failed", error="No media found", message_id=message.message_id)
+            await _record_failure(user_id, url, text, "No media found", message.message_id)
             await _report_failure(reply_msg, "No downloadable media was found at this link.")
             return False
 
@@ -1719,8 +1763,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
         if len(files) == 1:
             f = files[0]
             if not os.path.exists(f) or os.path.getsize(f) == 0:
-                add_failed_download(user_id, url, text, "File empty or missing after download")
-                record_download_history(user_id, url=url, status="failed", error="File empty or missing after download", message_id=message.message_id)
+                await _record_failure(user_id, url, text, "File empty or missing after download", message.message_id)
                 await _report_failure(reply_msg, "The downloaded file came back empty or disappeared before upload.")
                 return False
             try:
@@ -1732,8 +1775,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                         await _on_download_success(user_id, url=url, original_url=original_url, title=title, message_id=message.message_id, reply_msg=reply_msg)
                         return True
                     else:
-                        add_failed_download(user_id, url, text, "File >50MB and cloud upload failed")
-                        record_download_history(user_id, url=url, status="failed", error="File >50MB and cloud upload failed", message_id=message.message_id)
+                        await _record_failure(user_id, url, text, "File >50MB and cloud upload failed", message.message_id)
                         await _report_failure(reply_msg, "The file is over Telegram's 50MB limit and the cloud upload failed.")
                         return False
                         
@@ -1765,8 +1807,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                         return True
                     except Exception as retry_e:
                         logger.error(f"Retry as document failed: {retry_e}")
-                add_failed_download(user_id, url, text, f"Failed to send: {e}")
-                record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
+                await _record_failure(user_id, url, text, f"Failed to send: {e}", message.message_id)
                 await _report_failure(reply_msg, f"Telegram rejected the upload: {e}")
                 return False
             finally:
@@ -1790,8 +1831,7 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
                 return True
             except Exception as e:
                 logger.error(f"Failed to send album: {e}")
-                add_failed_download(user_id, url, text, f"Failed to send album: {e}")
-                record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
+                await _record_failure(user_id, url, text, f"Failed to send album: {e}", message.message_id)
                 await _report_failure(reply_msg, f"Failed to send the album: {e}")
                 return False
             finally:
@@ -1813,15 +1853,16 @@ async def _process_single_link_impl(message, url: str, text: str, user_id: int) 
         error_msg = e.message if hasattr(e, 'message') else str(e)
         if len(error_msg) > 800:
             error_msg = error_msg[:800] + "... [Truncated]"
-        add_failed_download(user_id, url, text, f"Download failed: {error_msg[:120]}")
-        record_download_history(user_id, url=url, status="failed", error=str(error_msg)[:120], message_id=message.message_id)
+        await _record_failure(
+            user_id, url, text, f"Download failed: {error_msg[:120]}", message.message_id,
+            history_error=str(error_msg)[:120]
+        )
         await _report_failure(reply_msg, error_msg)
         return False
     except Exception as e:
         import traceback
         logger.error(f"Error processing link: {e}\n{traceback.format_exc()}")
-        add_failed_download(user_id, url, text, f"Error: {e}")
-        record_download_history(user_id, url=url, status="failed", error=str(e), message_id=message.message_id)
+        await _record_failure(user_id, url, text, f"Error: {e}", message.message_id)
         await _report_failure(reply_msg, e)
         return False
 
@@ -1830,13 +1871,14 @@ async def handle_replied_link(message, reply_to, url: str, user_text: str, user_
     # 1. Check if user explicitly wants to force download (typed "retry", "download", "-f", etc.)
     is_force_download = bool(re.search(r'\b(retry|redownload|download|dl|again|-f)\b', user_text.lower()))
     
-    # 2. Check retry queue
-    failed_items = get_failed_queue(user_id)
+    # 2 & 3. The retry queue and download history are two blocking round trips; run them together
+    # off the event loop so replying to a link doesn't stall every other update in flight.
+    failed_items, history_item = await asyncio.gather(
+        asyncio.to_thread(get_failed_queue, user_id),
+        asyncio.to_thread(get_download_history_item, user_id, url),
+    )
     clean_url = url.split('?')[0]
     failed_match = next((item for item in failed_items if item.get('url') == url or item.get('url', '').split('?')[0] == clean_url), None)
-    
-    # 3. Check download history
-    history_item = get_download_history_item(user_id, url)
     
     # 4. Check reply_to message itself
     is_reply_to_bot = bool(reply_to.from_user and reply_to.from_user.is_bot)
