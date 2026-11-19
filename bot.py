@@ -28,7 +28,7 @@ from logging.handlers import RotatingFileHandler
 import hashlib
 from urllib.parse import urlparse
 
-VERSION = "v2.17.1"
+VERSION = "v2.17.2"
 
 # Enable logging with rotation and silenced verbose URLs
 logging.basicConfig(
@@ -43,7 +43,7 @@ scraper_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="scraper
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-skg5.onrender.com")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://media-downloader-bot-2ia1.onrender.com")
 
 # Admin user authorization
 raw_admins = os.getenv("ADMIN_USER_IDS", "")
@@ -3109,7 +3109,9 @@ async def main():
     await application.initialize()
     await application.start()
     
-    is_render = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+    # RENDER_SERVICE_ID is deliberately NOT a signal here: it also lives in a developer's .env
+    # for deploy queries, which would silently switch a local run onto the webhook branch.
+    is_render = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
     if is_render:
         WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
         if not WEBHOOK_SECRET and TOKEN:
