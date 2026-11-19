@@ -28,7 +28,7 @@ from logging.handlers import RotatingFileHandler
 import hashlib
 from urllib.parse import urlparse
 
-VERSION = "v2.17.2"
+VERSION = "v2.17.3"
 
 # Enable logging with rotation and silenced verbose URLs
 logging.basicConfig(
@@ -158,6 +158,9 @@ GLOBAL_PAGE_FETCH_SEMAPHORE = asyncio.Semaphore(20)
 # get their own budget instead of occupying download slots that other users are waiting on.
 GIF_ENCODE_SEMAPHORE = asyncio.Semaphore(2)
 GIF_ENCODE_WORKERS = 2
+# Animations are sent one message each, so a 20-item catalogue was one upload at a time.
+# A few in flight at once keeps gallery delivery fast without tripping Telegram flood limits.
+ANIMATION_UPLOAD_CONCURRENCY = 3
 MAX_ARCHIVE_PAGES = 500
 MAX_NOVEL_CHAPTERS = 2000
 
@@ -1097,6 +1100,9 @@ async def download_media(url: str, media_indices: list = None, as_files: bool = 
             'socket_timeout': 30,
             'retries': 3,
             'fragment_retries': 3,
+            # HLS/DASH sources (Twitter, v.redd.it, TikTok CDN) are fetched as many small
+            # fragments; yt-dlp pulls them one at a time unless told otherwise.
+            'concurrent_fragment_downloads': 4,
         }
         
         if media_indices:
@@ -1363,27 +1369,42 @@ async def send_album(message, files, as_files, caption=None):
                     dim_results = list(ex.map(get_video_dimensions, anim_files))
                 dim_map = dict(zip(anim_files, dim_results))
 
-                sent = 0
-                last_error = None
-                for idx, f in enumerate(anim_files):
+                # Upload a few at a time: sending a 20-animation catalogue strictly one by one
+                # made the uploads, not the download or the encode, the slowest part of delivery.
+                upload_slot = asyncio.Semaphore(ANIMATION_UPLOAD_CONCURRENCY)
+
+                async def _send_one_animation(idx, f):
                     w, h = dim_map.get(f, (None, None))
                     v_kw = {'read_timeout': 300, 'write_timeout': 300}
                     if w: v_kw['width'] = w
                     if h: v_kw['height'] = h
                     cap = caption if idx == 0 else None
                     pm = 'HTML' if cap else None
-                    try:
-                        with open(f, 'rb') as handle:
-                            await message.reply_animation(animation=handle, caption=cap, parse_mode=pm, allow_sending_without_reply=True, **v_kw)
-                        sent += 1
-                    except Exception as anim_err:
-                        # One rejected animation must not discard the rest of the catalogue
-                        last_error = anim_err
-                        size_mb = os.path.getsize(f) / (1024 * 1024) if os.path.exists(f) else -1
-                        logger.warning(f"Animation upload failed for {os.path.basename(f)} ({size_mb:.1f}MB): {anim_err}")
+                    async with upload_slot:
+                        for attempt in range(2):
+                            try:
+                                with open(f, 'rb') as handle:
+                                    await message.reply_animation(animation=handle, caption=cap, parse_mode=pm, allow_sending_without_reply=True, **v_kw)
+                                return None
+                            except RetryAfter as ra:
+                                # Flood control is expected with parallel uploads: wait it out once
+                                if attempt:
+                                    return ra
+                                await asyncio.sleep(getattr(ra, 'retry_after', 3) + 1)
+                            except Exception as anim_err:
+                                return anim_err
+                    return None
+
+                outcomes = await asyncio.gather(*[_send_one_animation(i, f) for i, f in enumerate(anim_files)])
+                # One rejected animation must not discard the rest of the catalogue
+                failures = [(f, err) for f, err in zip(anim_files, outcomes) if err]
+                for f, err in failures:
+                    size_mb = os.path.getsize(f) / (1024 * 1024) if os.path.exists(f) else -1
+                    logger.warning(f"Animation upload failed for {os.path.basename(f)} ({size_mb:.1f}MB): {err}")
+                sent = len(anim_files) - len(failures)
                 if sent == 0:
-                    raise RuntimeError(f"all {len(anim_files)} animation uploads failed: {last_error}")
-                if sent < len(anim_files):
+                    raise RuntimeError(f"all {len(anim_files)} animation uploads failed: {failures[0][1] if failures else 'unknown'}")
+                if failures:
                     logger.warning(f"Delivered {sent}/{len(anim_files)} animations for this album")
                 return
 
